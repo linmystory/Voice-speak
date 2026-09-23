@@ -30,6 +30,12 @@ jobs:
       - name: Thêm nền tảng Android vào project Capacitor
         run: npx cap add android
 
+      - name: Bật hỗ trợ biên dịch Kotlin cho project Android
+        run: |
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"/}' android/build.gradle
+          sed -i "s/apply plugin: 'com.android.application'/apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'/" android/app/build.gradle
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"/}' android/app/build.gradle
+
       - name: Copy plugin native (Kotlin) vào project Android
         run: |
           mkdir -p android/app/src/main/java/com/docdoc/app
