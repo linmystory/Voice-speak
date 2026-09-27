@@ -1,58 +1,98 @@
 name: Build Android APK
 
-# Chạy tự động mỗi khi có commit mới, hoặc khi bạn tự bấm "Run workflow" trong tab Actions
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Lấy mã nguồn từ repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Cài Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
-      - name: Cài Java (bắt buộc cho Gradle/Android)
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
+          cache: gradle
 
-      - name: Cài các gói phụ thuộc (Capacitor)
-        run: npm install
+      - name: Install npm dependencies
+        run: npm install --no-audit --no-fund
 
-      - name: Thêm nền tảng Android vào project Capacitor
+      - name: Generate Android project
         run: npx cap add android
 
-      - name: Bật hỗ trợ biên dịch Kotlin cho project Android
+      - name: Configure Kotlin for native plugin
+        shell: bash
         run: |
-          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"/}' android/build.gradle
-          sed -i "s/apply plugin: 'com.android.application'/apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'/" android/app/build.gradle
-          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"/}' android/app/build.gradle
+          python3 - <<'PY'
+          from pathlib import Path
 
-      - name: Copy plugin native (Kotlin) vào project Android
+          root = Path('android/build.gradle')
+          text = root.read_text(encoding='utf-8')
+          kotlin_line = 'classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"'
+          if kotlin_line not in text:
+              marker = 'dependencies {'
+              if marker not in text:
+                  raise SystemExit('Cannot find root Gradle dependencies block.')
+              text = text.replace(marker, marker + '\n        ' + kotlin_line, 1)
+              root.write_text(text, encoding='utf-8')
+
+          app = Path('android/app/build.gradle')
+          text = app.read_text(encoding='utf-8')
+          if "apply plugin: 'kotlin-android'" not in text:
+              marker = "apply plugin: 'com.android.application'"
+              if marker not in text:
+                  raise SystemExit('Cannot find Android application plugin declaration.')
+              text = text.replace(marker, marker + "\napply plugin: 'kotlin-android'", 1)
+          if 'kotlin-stdlib:1.9.24' not in text:
+              marker = 'dependencies {'
+              if marker not in text:
+                  raise SystemExit('Cannot find app Gradle dependencies block.')
+              text = text.replace(
+                  marker,
+                  marker + '\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"',
+                  1,
+              )
+          app.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Install native Android plugin
+        shell: bash
         run: |
           mkdir -p android/app/src/main/java/com/docdoc/app
           cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/TtsFileSaverPlugin.kt
           cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/MainActivity.java
 
-      - name: Đồng bộ Capacitor
+      - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Build file APK (bản debug, để cài thử ngay)
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
 
-      - name: Tải APK lên làm "Artifact" để tải về
+      - name: Verify APK exists
+        run: test -s android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
+          name: doc-van-ban-tts-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
