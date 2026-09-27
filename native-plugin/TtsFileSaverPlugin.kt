@@ -1,77 +1,268 @@
 package com.docdoc.app
 
-// ============================================================================
-// TtsFileSaverPlugin.kt
-//
-// Plugin Capacitor native cho Android, dùng để tổng hợp văn bản thành GIỌNG NÓI
-// và LƯU RA FILE WAV THẬT trên thiết bị, sử dụng bộ máy TextToSpeech (TTS) có
-// sẵn của hệ điều hành Android — hoàn toàn offline, không cần API key hay
-// dịch vụ đám mây nào.
-//
-// Vì sao cần plugin native riêng?
-// Web Speech API (window.speechSynthesis) chạy trong WebView CHỈ có thể phát
-// âm thanh trực tiếp ra loa, không cho phép lấy dữ liệu âm thanh dưới dạng
-// file. Ngược lại, Android cung cấp hàm gốc:
-//     TextToSpeech.synthesizeToFile(text, params, file, utteranceId)
-// hàm này ghi thẳng dữ liệu âm thanh (PCM/WAV) ra file mà KHÔNG phát ra loa.
-// Plugin này gọi hàm đó, xử lý việc chia nhỏ văn bản dài (do TTS có giới hạn
-// độ dài mỗi lần tổng hợp), rồi ghép nhiều đoạn WAV lại thành một file hoàn
-// chỉnh duy nhất.
-//
-// Cách cài đặt: xem HUONG_DAN_CAI_DAT.md đi kèm trong dự án.
-// ============================================================================
-
 import android.content.ContentValues
-import android.content.Context
-import android.content.Intent
-import android.media.AudioAttributes
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
-import androidx.core.content.FileProvider
+import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import java.io.BufferedOutputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.OutputStream
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+/**
+ * Native Android TTS plugin.
+ *
+ * - Reads text with Android TextToSpeech.
+ * - Synthesizes WAV files offline when the installed TTS engine supports it.
+ * - Merges PCM WAV chunks into one valid WAV.
+ * - Saves the result to Music/DocDocTTS using MediaStore on Android 10+.
+ *
+ * The web UI may use Web Speech API for playback, while this plugin is used
+ * for native playback fallback and file export.
+ */
 @CapacitorPlugin(name = "TtsFileSaver")
 class TtsFileSaverPlugin : Plugin() {
 
+    companion object {
+        private const val DEFAULT_LANG = "vi-VN"
+        private const val SAFE_CHUNK_LEN = 350
+        private const val READY_TIMEOUT_SECONDS = 8L
+        private const val SYNTH_CHUNK_TIMEOUT_SECONDS = 30L
+        private const val SPEAK_CHUNK_TIMEOUT_SECONDS = 120L
+    }
+
     private var tts: TextToSpeech? = null
+
+    @Volatile
     private var ttsReady = false
+
+    private val ttsReadyLatch = CountDownLatch(1)
     private val executor = Executors.newSingleThreadExecutor()
 
-    // Độ dài an toàn mỗi đoạn văn bản gửi cho TTS (ký tự). Android TTS có giới
-    // hạn thực tế do TextToSpeech.getMaxSpeechInputLength() cung cấp, nhưng ta
-    // dùng một ngưỡng an toàn nhỏ hơn để tránh lỗi trên các máy/engine khác nhau.
-    private val SAFE_CHUNK_LEN = 350
+    @Volatile
+    private var speakGeneration = 0L
 
     override fun load() {
         super.load()
+
+        // Capacitor loads the plugin on the main thread; TextToSpeech initialization
+        // should therefore happen here rather than on the worker executor.
         tts = TextToSpeech(context) { status ->
-            ttsReady = (status == TextToSpeech.SUCCESS)
+            ttsReady = status == TextToSpeech.SUCCESS
+            ttsReadyLatch.countDown()
         }
     }
 
-    // ------------------------------------------------------------------
-    // Hàm chính: nhận văn bản, tùy chọn giọng/tốc độ/cao độ, trả về Uri file
-    // ------------------------------------------------------------------
+    private fun awaitTtsReady(): Boolean {
+        if (ttsReady && tts != null) return true
+        return try {
+            ttsReadyLatch.await(READY_TIMEOUT_SECONDS, TimeUnit.SECONDS) &&
+                ttsReady && tts != null
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    @PluginMethod
+    fun getVoices(call: PluginCall) {
+        executor.execute {
+            if (!awaitTtsReady()) {
+                call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                return@execute
+            }
+
+            try {
+                val arr = JSArray()
+                val voices = tts?.voices.orEmpty()
+                    .sortedWith(compareBy({ it.locale.language }, { it.name }))
+
+                voices.forEach { voice ->
+                    val obj = JSObject()
+                    obj.put("name", voice.name)
+                    obj.put("lang", voice.locale.toLanguageTag())
+                    arr.put(obj)
+                }
+
+                val ret = JSObject()
+                ret.put("voices", arr)
+                call.resolve(ret)
+            } catch (e: Exception) {
+                call.reject("Không thể lấy danh sách giọng đọc: ${e.message}", e)
+            }
+        }
+    }
+
+    @PluginMethod
+    fun speak(call: PluginCall) {
+        val text = call.getString("text")
+        if (text.isNullOrBlank()) {
+            call.reject("Thiếu văn bản cần đọc (text).")
+            return
+        }
+
+        val voiceName = call.getString("voiceName").orEmpty()
+        val lang = call.getString("lang").orEmpty().ifBlank { DEFAULT_LANG }
+        val rate = sanitizeRate(call.getFloat("rate") ?: 1.0f)
+        val pitch = sanitizePitch(call.getFloat("pitch") ?: 1.0f)
+
+        // A new speak request invalidates an older one.
+        val generation = synchronized(this) {
+            speakGeneration += 1
+            speakGeneration
+        }
+
+        executor.execute {
+            if (!awaitTtsReady()) {
+                call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                return@execute
+            }
+
+            try {
+                val engine = tts ?: throw IOException("TTS engine không khả dụng.")
+                applyVoiceSettings(engine, voiceName, lang, rate, pitch)
+
+                val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
+                if (chunks.isEmpty()) {
+                    call.reject("Văn bản rỗng sau khi xử lý.")
+                    return@execute
+                }
+
+                for ((index, chunk) in chunks.withIndex()) {
+                    if (generation != speakGeneration) return@execute
+
+                    val utteranceId = "speak_${generation}_$index"
+                    val latch = CountDownLatch(1)
+                    var errorMessage: String? = null
+
+                    val listener = object : UtteranceProgressListener() {
+                        override fun onStart(id: String?) = Unit
+
+                        override fun onDone(id: String?) {
+                            if (id == utteranceId) latch.countDown()
+                        }
+
+                        @Deprecated("Deprecated in Java")
+                        override fun onError(id: String?) {
+                            if (id == utteranceId) {
+                                errorMessage = "TTS engine báo lỗi."
+                                latch.countDown()
+                            }
+                        }
+
+                        override fun onError(id: String?, errorCode: Int) {
+                            if (id == utteranceId) {
+                                errorMessage = "TTS engine báo lỗi (mã $errorCode)."
+                                latch.countDown()
+                            }
+                        }
+
+                        override fun onStop(id: String?, interrupted: Boolean) {
+                            if (id == utteranceId) latch.countDown()
+                        }
+                    }
+
+                    engine.setOnUtteranceProgressListener(listener)
+
+                    val result = engine.speak(
+                        chunk,
+                        if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD,
+                        Bundle(),
+                        utteranceId
+                    )
+
+                    if (result != TextToSpeech.SUCCESS) {
+                        throw IOException("Không thể bắt đầu đọc đoạn ${index + 1}/${chunks.size}.")
+                    }
+
+                    val finished = latch.await(SPEAK_CHUNK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    if (!finished) {
+                        engine.stop()
+                        throw IOException("TTS không phản hồi sau ${SPEAK_CHUNK_TIMEOUT_SECONDS} giây.")
+                    }
+
+                    if (generation != speakGeneration) {
+                        // stopSpeaking() invalidated this session. Resolve the
+                        // original JS promise so the WebView never remains stuck
+                        // waiting for a native speak() call that was intentionally stopped.
+                        call.resolve()
+                        return@execute
+                    }
+                    if (errorMessage != null) throw IOException(errorMessage)
+                }
+
+                if (generation == speakGeneration) call.resolve()
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                call.reject("Đã dừng quá trình đọc.")
+            } catch (e: Exception) {
+                if (generation == speakGeneration) {
+                    call.reject("Lỗi khi đọc văn bản: ${e.message}", e)
+                }
+            }
+        }
+    }
+
+    @PluginMethod
+    fun stopSpeaking(call: PluginCall) {
+        synchronized(this) {
+            speakGeneration += 1
+        }
+        // Must be called immediately rather than queued on executor; the executor
+        // may be waiting on a TTS callback.
+        try {
+            tts?.stop()
+        } catch (_: Exception) {
+            // Stopping is best-effort.
+        }
+        call.resolve()
+    }
+
+    @PluginMethod
+    fun shareFile(call: PluginCall) {
+        try {
+            val uriString = call.getString("uri")?.trim().orEmpty()
+            if (uriString.isBlank()) {
+                call.reject("Thiếu URI của file cần chia sẻ.")
+                return
+            }
+
+            val uri = Uri.parse(uriString)
+            val fileName = call.getString("fileName")?.trim().orEmpty().ifBlank { "audio.wav" }
+            val shareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "audio/wav"
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                putExtra(android.content.Intent.EXTRA_TITLE, fileName)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = android.content.ClipData.newRawUri(fileName, uri)
+            }
+
+            val chooser = android.content.Intent.createChooser(shareIntent, "Chia sẻ file âm thanh")
+            chooser.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(chooser)
+            call.resolve()
+        } catch (e: Exception) {
+            call.reject("Không thể mở chức năng chia sẻ file: ${e.message}", e)
+        }
+    }
+
     @PluginMethod
     fun synthesizeToFile(call: PluginCall) {
         val text = call.getString("text")
@@ -79,184 +270,202 @@ class TtsFileSaverPlugin : Plugin() {
             call.reject("Thiếu văn bản cần đọc (text).")
             return
         }
-        if (!ttsReady || tts == null) {
-            call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
-            return
-        }
 
-        val voiceName = call.getString("voiceName") ?: ""
-        val lang = call.getString("lang") ?: "vi-VN"
-        val rate = (call.getFloat("rate") ?: 1.0f)
-        val pitch = (call.getFloat("pitch") ?: 1.0f)
+        val voiceName = call.getString("voiceName").orEmpty()
+        val lang = call.getString("lang").orEmpty().ifBlank { DEFAULT_LANG }
+        val rate = sanitizeRate(call.getFloat("rate") ?: 1.0f)
+        val pitch = sanitizePitch(call.getFloat("pitch") ?: 1.0f)
 
         executor.execute {
+            var tmpDir: File? = null
+            var mergedFile: File? = null
+            var savedUri: Uri? = null
+
             try {
-                applyVoiceSettings(voiceName, lang, rate, pitch)
+                if (!awaitTtsReady()) {
+                    call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
+                    return@execute
+                }
+
+                val engine = tts ?: throw IOException("TTS engine không khả dụng.")
+                applyVoiceSettings(engine, voiceName, lang, rate, pitch)
+
                 val chunks = splitIntoChunks(text, SAFE_CHUNK_LEN)
                 if (chunks.isEmpty()) {
                     call.reject("Văn bản rỗng sau khi xử lý.")
                     return@execute
                 }
 
-                val tmpDir = File(context.cacheDir, "tts_tmp_${System.currentTimeMillis()}")
-                tmpDir.mkdirs()
+                tmpDir = File(context.cacheDir, "tts_tmp_${UUID.randomUUID()}").also {
+                    if (!it.mkdirs() && !it.isDirectory) {
+                        throw IOException("Không thể tạo thư mục tạm.")
+                    }
+                }
 
-                val chunkFiles = ArrayList<File>()
-                var synthesisFailed = false
-                var failMessage = ""
+                val chunkFiles = ArrayList<File>(chunks.size)
 
                 for ((index, chunkText) in chunks.withIndex()) {
                     val chunkFile = File(tmpDir, "chunk_%04d.wav".format(index))
-                    val utteranceId = "chunk_$index"
-                    val latch = CountDownLatch(1)
-                    var thisChunkFailed = false
-
-                    val listener = object : UtteranceProgressListener() {
-                        override fun onStart(id: String?) {}
-                        override fun onDone(id: String?) {
-                            if (id == utteranceId) latch.countDown()
-                        }
-                        @Deprecated("Deprecated in Java")
-                        override fun onError(id: String?) {
-                            if (id == utteranceId) {
-                                thisChunkFailed = true
-                                latch.countDown()
-                            }
-                        }
-                        override fun onError(id: String?, errorCode: Int) {
-                            if (id == utteranceId) {
-                                thisChunkFailed = true
-                                latch.countDown()
-                            }
-                        }
-                    }
-
-                    tts!!.setOnUtteranceProgressListener(listener)
-
-                    val params = Bundle()
-                    val result = tts!!.synthesizeToFile(chunkText, params, chunkFile, utteranceId)
-                    if (result != TextToSpeech.SUCCESS) {
-                        thisChunkFailed = true
-                        latch.countDown()
-                    }
-
-                    // Chờ tối đa 20 giây cho mỗi đoạn (đoạn đã được giới hạn ngắn nên rất hiếm khi cần lâu vậy)
-                    val finished = latch.await(20, TimeUnit.SECONDS)
-                    if (!finished || thisChunkFailed || !chunkFile.exists() || chunkFile.length() == 0L) {
-                        synthesisFailed = true
-                        failMessage = "Không thể tổng hợp đoạn văn bản thứ ${index + 1}/${chunks.size}."
-                        break
-                    }
+                    synthesizeChunk(engine, chunkText, chunkFile, index, chunks.size)
+                    validateWav(chunkFile)
                     chunkFiles.add(chunkFile)
                 }
 
-                if (synthesisFailed) {
-                    tmpDir.deleteRecursively()
-                    call.reject(failMessage)
-                    return@execute
-                }
-
-                // Ghép các file WAV nhỏ thành 1 file WAV hoàn chỉnh
-                val mergedFile = File(context.cacheDir, "tts_output_${System.currentTimeMillis()}.wav")
+                mergedFile = File(context.cacheDir, "tts_output_${UUID.randomUUID()}.wav")
                 mergeWavFiles(chunkFiles, mergedFile)
-                tmpDir.deleteRecursively()
 
-                // Lưu file vào bộ nhớ công khai (Music/DocDocTTS) để người dùng dễ tìm lại,
-                // đồng thời trả về content Uri để JS có thể chia sẻ/mở file.
                 val fileName = "doc-van-ban-${System.currentTimeMillis()}.wav"
-                val savedUri = saveWavToPublicStorage(mergedFile, fileName)
-                mergedFile.delete()
-
+                savedUri = saveWavToPublicStorage(mergedFile, fileName)
                 if (savedUri == null) {
-                    call.reject("Không thể lưu file âm thanh vào bộ nhớ thiết bị.")
-                    return@execute
+                    throw IOException("Không thể lưu file âm thanh vào bộ nhớ thiết bị.")
                 }
 
                 val ret = JSObject()
                 ret.put("uri", savedUri.toString())
                 ret.put("fileName", fileName)
                 call.resolve(ret)
-
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                call.reject("Đã dừng quá trình tạo file.")
             } catch (e: Exception) {
+                // If MediaStore insertion succeeded but copying/updating failed,
+                // remove the incomplete item so it does not remain as a ghost file.
+                savedUri?.let { uri ->
+                    try {
+                        context.contentResolver.delete(uri, null, null)
+                    } catch (_: Exception) {
+                    }
+                }
                 call.reject("Lỗi khi tạo file âm thanh: ${e.message}", e)
+            } finally {
+                try {
+                    tmpDir?.deleteRecursively()
+                    mergedFile?.delete()
+                } catch (_: Exception) {
+                }
             }
         }
     }
 
-    // ------------------------------------------------------------------
-    // Mở hộp thoại Chia sẻ / Lưu của Android cho file vừa tạo
-    // ------------------------------------------------------------------
-    @PluginMethod
-    fun shareFile(call: PluginCall) {
-        val uriString = call.getString("uri")
-        if (uriString.isNullOrBlank()) {
-            call.reject("Thiếu đường dẫn file (uri).")
-            return
+    private fun synthesizeChunk(
+        engine: TextToSpeech,
+        text: String,
+        outputFile: File,
+        index: Int,
+        total: Int
+    ) {
+        val utteranceId = "file_${UUID.randomUUID()}"
+        val latch = CountDownLatch(1)
+        var errorMessage: String? = null
+
+        val listener = object : UtteranceProgressListener() {
+            override fun onStart(id: String?) = Unit
+
+            override fun onDone(id: String?) {
+                if (id == utteranceId) latch.countDown()
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onError(id: String?) {
+                if (id == utteranceId) {
+                    errorMessage = "TTS engine báo lỗi."
+                    latch.countDown()
+                }
+            }
+
+            override fun onError(id: String?, errorCode: Int) {
+                if (id == utteranceId) {
+                    errorMessage = "TTS engine báo lỗi (mã $errorCode)."
+                    latch.countDown()
+                }
+            }
+
+            override fun onStop(id: String?, interrupted: Boolean) {
+                if (id == utteranceId) latch.countDown()
+            }
         }
-        try {
-            val uri = Uri.parse(uriString)
-            val intent = Intent(Intent.ACTION_SEND)
-            intent.type = "audio/wav"
-            intent.putExtra(Intent.EXTRA_STREAM, uri)
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            val chooser = Intent.createChooser(intent, "Lưu / Chia sẻ file âm thanh")
-            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(chooser)
-            call.resolve()
-        } catch (e: Exception) {
-            call.reject("Không thể mở hộp thoại chia sẻ: ${e.message}", e)
+
+        engine.setOnUtteranceProgressListener(listener)
+
+        // File overload is the Android API used by TextToSpeech to write WAV data.
+        val result = engine.synthesizeToFile(text, Bundle(), outputFile, utteranceId)
+        if (result != TextToSpeech.SUCCESS) {
+            throw IOException("Không thể bắt đầu tổng hợp đoạn $index/$total.")
         }
+
+        val finished = latch.await(SYNTH_CHUNK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        if (!finished) {
+            engine.stop()
+            throw IOException("Không thể tổng hợp đoạn $index/$total trong thời gian cho phép.")
+        }
+
+        if (errorMessage != null) throw IOException(errorMessage)
     }
 
-    // ------------------------------------------------------------------
-    // Chọn giọng nói + áp dụng tốc độ/cao độ cho TTS engine
-    // ------------------------------------------------------------------
-    private fun applyVoiceSettings(voiceName: String, lang: String, rate: Float, pitch: Float) {
-        val engine = tts ?: return
+    private fun applyVoiceSettings(
+        engine: TextToSpeech,
+        voiceName: String,
+        lang: String,
+        rate: Float,
+        pitch: Float
+    ) {
         var chosenVoice: Voice? = null
 
         if (voiceName.isNotBlank()) {
             chosenVoice = engine.voices?.firstOrNull { it.name == voiceName }
         }
-        if (chosenVoice == null && lang.isNotBlank()) {
-            val locale = parseLocale(lang)
-            chosenVoice = engine.voices?.firstOrNull { it.locale.language == locale.language }
+
+        val locale = parseLocale(lang)
+        if (chosenVoice == null) {
+            chosenVoice = engine.voices?.firstOrNull {
+                it.locale.toLanguageTag().equals(locale.toLanguageTag(), ignoreCase = true)
+            } ?: engine.voices?.firstOrNull {
+                it.locale.language.equals(locale.language, ignoreCase = true)
+            }
         }
+
         if (chosenVoice != null) {
             engine.voice = chosenVoice
-        } else if (lang.isNotBlank()) {
-            engine.language = parseLocale(lang)
+        } else {
+            val result = engine.setLanguage(locale)
+            if (result == TextToSpeech.LANG_MISSING_DATA ||
+                result == TextToSpeech.LANG_NOT_SUPPORTED
+            ) {
+                throw IOException("Thiết bị chưa cài giọng cho ngôn ngữ ${locale.toLanguageTag()}.")
+            }
         }
 
         engine.setSpeechRate(rate)
         engine.setPitch(pitch)
     }
 
+    private fun sanitizeRate(value: Float): Float =
+        if (value.isFinite() && value in 0.1f..4.0f) value else 1.0f
+
+    private fun sanitizePitch(value: Float): Float =
+        if (value.isFinite() && value in 0.1f..2.0f) value else 1.0f
+
     private fun parseLocale(bcp47: String): Locale {
-        return try {
-            Locale.forLanguageTag(bcp47)
-        } catch (e: Exception) {
-            Locale("vi", "VN")
-        }
+        val locale = Locale.forLanguageTag(bcp47)
+        return if (locale.language.isNullOrBlank()) Locale.forLanguageTag(DEFAULT_LANG) else locale
     }
 
-    // ------------------------------------------------------------------
-    // Tách văn bản dài thành các đoạn ngắn theo câu, an toàn cho TTS
-    // ------------------------------------------------------------------
     private fun splitIntoChunks(text: String, maxLen: Int): List<String> {
-        val normalized = text.replace("\r\n", "\n").trim()
+        val normalized = text.replace("\r\n", "\n").replace('\r', '\n').trim()
         if (normalized.isEmpty()) return emptyList()
 
-        val sentenceRegex = Regex("(?<=[.!?…])\\s+|\\n+")
-        val rawSentences = normalized.split(sentenceRegex).map { it.trim() }.filter { it.isNotEmpty() }
+        val rawSentences = normalized
+            .split(Regex("(?<=[.!?…])\\s+|\\n+"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
 
         val chunks = ArrayList<String>()
-        var buffer = StringBuilder()
+        var buffer = ""
 
         fun flushBuffer() {
             if (buffer.isNotEmpty()) {
-                chunks.add(buffer.toString())
-                buffer = StringBuilder()
+                chunks.add(buffer)
+                buffer = ""
             }
         }
 
@@ -270,187 +479,299 @@ class TtsFileSaverPlugin : Plugin() {
                     chunks.add(remaining.substring(0, cut).trim())
                     remaining = remaining.substring(cut).trim()
                 }
-                if (remaining.isNotEmpty()) buffer.append(remaining)
+                if (remaining.isNotEmpty()) buffer = remaining
                 continue
             }
 
-            val candidateLen = buffer.length + 1 + sentence.length
-            if (candidateLen > maxLen) {
-                flushBuffer()
-                buffer.append(sentence)
+            val candidateLength = if (buffer.isEmpty()) {
+                sentence.length
             } else {
-                if (buffer.isNotEmpty()) buffer.append(' ')
-                buffer.append(sentence)
+                buffer.length + 1 + sentence.length
+            }
+
+            if (candidateLength > maxLen) {
+                flushBuffer()
+                buffer = sentence
+            } else {
+                buffer = if (buffer.isEmpty()) sentence else "$buffer $sentence"
             }
         }
+
         flushBuffer()
         return chunks
     }
 
-    // ------------------------------------------------------------------
-    // Đọc header của 1 file WAV để lấy vị trí + kích thước phần dữ liệu âm thanh (PCM)
-    // ------------------------------------------------------------------
-    private data class WavInfo(val dataOffset: Int, val dataSize: Int, val headerBytes: ByteArray)
+    private data class WavInfo(
+        val dataOffset: Long,
+        val dataSize: Long,
+        val audioFormat: Int,
+        val channels: Int,
+        val sampleRate: Int,
+        val byteRate: Int,
+        val blockAlign: Int,
+        val bitsPerSample: Int
+    )
+
+    private fun readLe16(bytes: ByteArray, offset: Int): Int =
+        (bytes[offset].toInt() and 0xFF) or
+            ((bytes[offset + 1].toInt() and 0xFF) shl 8)
+
+    private fun readLe32(bytes: ByteArray, offset: Int): Long =
+        (bytes[offset].toLong() and 0xFF) or
+            ((bytes[offset + 1].toLong() and 0xFF) shl 8) or
+            ((bytes[offset + 2].toLong() and 0xFF) shl 16) or
+            ((bytes[offset + 3].toLong() and 0xFF) shl 24)
+
+    private fun readAscii(bytes: ByteArray, offset: Int, length: Int): String =
+        bytes.copyOfRange(offset, offset + length).toString(Charsets.US_ASCII)
 
     private fun readWavInfo(file: File): WavInfo {
         FileInputStream(file).use { input ->
-            val header = ByteArray(44)
-            var read = 0
-            while (read < 44) {
-                val n = input.read(header, read, 44 - read)
-                if (n < 0) break
-                read += n
+            val header = ByteArray(12)
+            readFully(input, header)
+            if (readAscii(header, 0, 4) != "RIFF" || readAscii(header, 8, 4) != "WAVE") {
+                throw IOException("File WAV không hợp lệ: ${file.name}")
             }
-            // Tìm chunk "data" (không phải lúc nào cũng nằm đúng byte 36-44 tuyệt đối,
-            // nhưng với file do Android TTS tạo ra thì theo chuẩn RIFF/WAVE cơ bản này là đủ)
-            var dataSize = ((header[43].toInt() and 0xFF) shl 24) or
-                    ((header[42].toInt() and 0xFF) shl 16) or
-                    ((header[41].toInt() and 0xFF) shl 8) or
-                    (header[40].toInt() and 0xFF)
-            if (dataSize <= 0) {
-                dataSize = (file.length() - 44).toInt()
+
+            var fmt: WavInfo? = null
+            var dataOffset = -1L
+            var dataSize = -1L
+            var position = 12L
+
+            val chunkHeader = ByteArray(8)
+            while (position + 8 <= file.length()) {
+                readFully(input, chunkHeader)
+                val chunkId = readAscii(chunkHeader, 0, 4)
+                val chunkSize = readLe32(chunkHeader, 4)
+                val payloadOffset = position + 8
+
+                if (chunkSize < 0 || payloadOffset + chunkSize > file.length()) {
+                    throw IOException("Chunk WAV không hợp lệ: ${file.name}")
+                }
+
+                when (chunkId) {
+                    "fmt " -> {
+                        // PCM fmt chunks are small; reading the entire chunk prevents
+                        // the stream cursor from becoming desynchronized when an
+                        // extended fmt chunk is encountered.
+                        if (chunkSize < 16L || chunkSize > 1024L) {
+                            throw IOException("fmt chunk không hợp lệ.")
+                        }
+                        val fmtBytes = ByteArray(chunkSize.toInt())
+                        readFully(input, fmtBytes)
+                        val audioFormat = readLe16(fmtBytes, 0)
+                        val channels = readLe16(fmtBytes, 2)
+                        val sampleRate = readLe32(fmtBytes, 4).toInt()
+                        val byteRate = readLe32(fmtBytes, 8).toInt()
+                        val blockAlign = readLe16(fmtBytes, 12)
+                        val bitsPerSample = readLe16(fmtBytes, 14)
+                        fmt = WavInfo(0, 0, audioFormat, channels, sampleRate, byteRate, blockAlign, bitsPerSample)
+                    }
+
+                    "data" -> {
+                        dataOffset = payloadOffset
+                        dataSize = chunkSize
+                        input.skipFully(chunkSize)
+                    }
+
+                    else -> input.skipFully(chunkSize)
+                }
+
+                // RIFF chunks are word aligned.
+                val padding = if ((chunkSize and 1L) != 0L) 1L else 0L
+                if (padding != 0L) input.skipFully(1)
+                position = payloadOffset + chunkSize + padding
             }
-            return WavInfo(44, dataSize, header)
+
+            val format = fmt ?: throw IOException("WAV không có fmt chunk.")
+            if (dataOffset < 0 || dataSize < 0) throw IOException("WAV không có data chunk.")
+
+            return format.copy(dataOffset = dataOffset, dataSize = dataSize)
         }
     }
 
-    // ------------------------------------------------------------------
-    // Ghép nhiều file WAV nhỏ thành 1 file WAV hoàn chỉnh (dùng chung format của file đầu tiên)
-    // ------------------------------------------------------------------
+    private fun validateWav(file: File): WavInfo {
+        if (!file.exists() || file.length() <= 44L) {
+            throw IOException("TTS không tạo được file WAV hợp lệ.")
+        }
+        val info = readWavInfo(file)
+        if (info.audioFormat != 1) {
+            throw IOException("TTS tạo định dạng WAV không phải PCM.")
+        }
+        if (info.channels <= 0 ||
+            info.sampleRate <= 0 ||
+            info.bitsPerSample <= 0 ||
+            info.blockAlign <= 0 ||
+            info.byteRate <= 0 ||
+            info.dataSize <= 0 ||
+            info.dataSize % info.blockAlign.toLong() != 0L
+        ) {
+            throw IOException("Thông số WAV không hợp lệ.")
+        }
+        return info
+    }
+
     private fun mergeWavFiles(files: List<File>, outFile: File) {
         if (files.isEmpty()) throw IOException("Không có đoạn âm thanh nào để ghép.")
 
-        val firstInfo = readWavInfo(files[0])
-        val headerTemplate = firstInfo.headerBytes.copyOf()
+        val infos = files.map { validateWav(it) }
+        val first = infos.first()
 
-        var totalDataSize = 0L
-        for (f in files) {
-            totalDataSize += (f.length() - 44).coerceAtLeast(0)
+        // All chunks must have the same PCM format; otherwise concatenating their
+        // raw sample bytes would produce corrupted audio.
+        infos.forEachIndexed { index, info ->
+            if (info.audioFormat != first.audioFormat ||
+                info.channels != first.channels ||
+                info.sampleRate != first.sampleRate ||
+                info.byteRate != first.byteRate ||
+                info.blockAlign != first.blockAlign ||
+                info.bitsPerSample != first.bitsPerSample
+            ) {
+                throw IOException("Định dạng WAV giữa các đoạn không đồng nhất (đoạn ${index + 1}).")
+            }
         }
 
-        BufferedOutputStream(FileOutputStream(outFile)).use { out ->
-            // Ghi header tạm, sẽ cập nhật lại kích thước sau
-            writeWavHeader(out, totalDataSize, headerTemplate)
-            for (f in files) {
-                FileInputStream(f).use { input ->
-                    input.skip(44)
-                    val buffer = ByteArray(8192)
-                    while (true) {
-                        val n = input.read(buffer)
-                        if (n < 0) break
-                        out.write(buffer, 0, n)
+        val totalDataSize = infos.sumOf { it.dataSize }
+        if (totalDataSize > 0xFFFFFFFFL - 36L) {
+            throw IOException("File WAV vượt quá giới hạn kích thước.")
+        }
+
+        BufferedOutputStream(FileOutputStream(outFile)).use { output ->
+            writeWavHeader(output, first, totalDataSize)
+
+            val buffer = ByteArray(8192)
+            files.forEachIndexed { index, file ->
+                FileInputStream(file).use { input ->
+                    input.skipFully(infos[index].dataOffset)
+                    var remaining = infos[index].dataSize
+                    while (remaining > 0) {
+                        val wanted = minOf(buffer.size.toLong(), remaining).toInt()
+                        val read = input.read(buffer, 0, wanted)
+                        if (read <= 0) throw IOException("Không thể đọc dữ liệu WAV.")
+                        output.write(buffer, 0, read)
+                        remaining -= read.toLong()
                     }
                 }
             }
         }
     }
 
-    private fun writeWavHeader(out: java.io.OutputStream, dataSize: Long, template: ByteArray) {
-        val byteRate = readInt32LE(template, 28)
-        val sampleRate = readInt32LE(template, 24)
-        val channels = readInt16LE(template, 22)
-        val bitsPerSample = readInt16LE(template, 34)
-        val blockAlign = readInt16LE(template, 32)
-
-        val totalDataLen = dataSize + 36
+    private fun writeWavHeader(
+        out: OutputStream,
+        info: WavInfo,
+        dataSize: Long
+    ) {
         val header = ByteArray(44)
-
         writeAscii(header, 0, "RIFF")
-        writeInt32LE(header, 4, totalDataLen.toInt())
+        writeLe32(header, 4, dataSize + 36)
         writeAscii(header, 8, "WAVE")
         writeAscii(header, 12, "fmt ")
-        writeInt32LE(header, 16, 16) // Subchunk1Size cho PCM
-        writeInt16LE(header, 20, 1)  // AudioFormat = 1 (PCM)
-        writeInt16LE(header, 22, channels)
-        writeInt32LE(header, 24, sampleRate)
-        writeInt32LE(header, 28, byteRate)
-        writeInt16LE(header, 32, blockAlign)
-        writeInt16LE(header, 34, bitsPerSample)
+        writeLe32(header, 16, 16)
+        writeLe16(header, 20, info.audioFormat)
+        writeLe16(header, 22, info.channels)
+        writeLe32(header, 24, info.sampleRate.toLong())
+        writeLe32(header, 28, info.byteRate.toLong())
+        writeLe16(header, 32, info.blockAlign)
+        writeLe16(header, 34, info.bitsPerSample)
         writeAscii(header, 36, "data")
-        writeInt32LE(header, 40, dataSize.toInt())
-
+        writeLe32(header, 40, dataSize)
         out.write(header)
     }
 
-    private fun readInt16LE(b: ByteArray, offset: Int): Int {
-        return (b[offset].toInt() and 0xFF) or ((b[offset + 1].toInt() and 0xFF) shl 8)
+    private fun writeLe16(bytes: ByteArray, offset: Int, value: Int) {
+        bytes[offset] = (value and 0xFF).toByte()
+        bytes[offset + 1] = ((value ushr 8) and 0xFF).toByte()
     }
 
-    private fun readInt32LE(b: ByteArray, offset: Int): Int {
-        return (b[offset].toInt() and 0xFF) or
-                ((b[offset + 1].toInt() and 0xFF) shl 8) or
-                ((b[offset + 2].toInt() and 0xFF) shl 16) or
-                ((b[offset + 3].toInt() and 0xFF) shl 24)
+    private fun writeLe32(bytes: ByteArray, offset: Int, value: Long) {
+        bytes[offset] = (value and 0xFF).toByte()
+        bytes[offset + 1] = ((value ushr 8) and 0xFF).toByte()
+        bytes[offset + 2] = ((value ushr 16) and 0xFF).toByte()
+        bytes[offset + 3] = ((value ushr 24) and 0xFF).toByte()
     }
 
-    private fun writeInt16LE(b: ByteArray, offset: Int, value: Int) {
-        b[offset] = (value and 0xFF).toByte()
-        b[offset + 1] = ((value shr 8) and 0xFF).toByte()
+    private fun writeAscii(bytes: ByteArray, offset: Int, value: String) {
+        val encoded = value.toByteArray(Charsets.US_ASCII)
+        System.arraycopy(encoded, 0, bytes, offset, encoded.size)
     }
 
-    private fun writeInt32LE(b: ByteArray, offset: Int, value: Int) {
-        b[offset] = (value and 0xFF).toByte()
-        b[offset + 1] = ((value shr 8) and 0xFF).toByte()
-        b[offset + 2] = ((value shr 16) and 0xFF).toByte()
-        b[offset + 3] = ((value shr 24) and 0xFF).toByte()
+    private fun readFully(input: FileInputStream, buffer: ByteArray) {
+        var offset = 0
+        while (offset < buffer.size) {
+            val read = input.read(buffer, offset, buffer.size - offset)
+            if (read < 0) throw IOException("File WAV bị thiếu dữ liệu.")
+            offset += read
+        }
     }
 
-    private fun writeAscii(b: ByteArray, offset: Int, text: String) {
-        val bytes = text.toByteArray(Charsets.US_ASCII)
-        System.arraycopy(bytes, 0, b, offset, bytes.size)
-    }
-
-    // ------------------------------------------------------------------
-    // Lưu file WAV vào bộ nhớ công khai của thiết bị (Music/DocDocTTS)
-    // Dùng MediaStore (Android 10+, không cần xin quyền runtime).
-    // ------------------------------------------------------------------
-    private fun saveWavToPublicStorage(sourceFile: File, displayName: String): Uri? {
-        val resolver = context.contentResolver
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.Audio.Media.DISPLAY_NAME, displayName)
-                put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
-                put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/DocDocTTS")
-                put(MediaStore.Audio.Media.IS_PENDING, 1)
+    private fun FileInputStream.skipFully(bytes: Long) {
+        var remaining = bytes
+        while (remaining > 0) {
+            val skipped = skip(remaining)
+            if (skipped > 0) {
+                remaining -= skipped
+            } else {
+                if (read() < 0) throw IOException("Không thể bỏ qua dữ liệu WAV.")
+                remaining--
             }
-            val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            val itemUri = resolver.insert(collection, values) ?: return null
+        }
+    }
 
-            resolver.openOutputStream(itemUri)?.use { out ->
+    /**
+     * Android 10+ only: MediaStore gives a shareable content:// URI and avoids
+     * legacy storage permissions. This app's supported deployment target is
+     * therefore Android 10 (API 29) or newer.
+     */
+    private fun saveWavToPublicStorage(sourceFile: File, displayName: String): Uri? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            throw IOException("Phiên bản ứng dụng này yêu cầu Android 10 (API 29) trở lên để lưu WAV.")
+        }
+
+        val resolver = context.contentResolver
+        val collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+
+        val values = ContentValues().apply {
+            put(MediaStore.Audio.Media.DISPLAY_NAME, displayName)
+            put(MediaStore.Audio.Media.MIME_TYPE, "audio/wav")
+            put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/DocDocTTS")
+            put(MediaStore.Audio.Media.IS_PENDING, 1)
+        }
+
+        val itemUri = resolver.insert(collection, values)
+            ?: throw IOException("MediaStore không tạo được mục file.")
+
+        try {
+            resolver.openOutputStream(itemUri, "w")?.use { output ->
                 FileInputStream(sourceFile).use { input ->
-                    input.copyTo(out)
-                }
-            } ?: return null
-
-            values.clear()
-            values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-            resolver.update(itemUri, values, null, null)
-            return itemUri
-        } else {
-            // Android 9 trở xuống: cần quyền WRITE_EXTERNAL_STORAGE (khai báo trong AndroidManifest.xml)
-            val musicDir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC),
-                "DocDocTTS"
-            )
-            if (!musicDir.exists()) musicDir.mkdirs()
-            val destFile = File(musicDir, displayName)
-            FileInputStream(sourceFile).use { input ->
-                FileOutputStream(destFile).use { output ->
                     input.copyTo(output)
                 }
+            } ?: throw IOException("Không thể mở file đích để ghi.")
+
+            val completed = ContentValues().apply {
+                put(MediaStore.Audio.Media.IS_PENDING, 0)
             }
-            return FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.fileprovider",
-                destFile
-            )
+            resolver.update(itemUri, completed, null, null)
+            return itemUri
+        } catch (e: Exception) {
+            try {
+                resolver.delete(itemUri, null, null)
+            } catch (_: Exception) {
+            }
+            throw e
         }
     }
 
     override fun handleOnDestroy() {
-        super.handleOnDestroy()
+        synchronized(this) {
+            speakGeneration += 1
+        }
+        try {
+            tts?.stop()
+        } catch (_: Exception) {
+        }
         tts?.shutdown()
+        tts = null
         executor.shutdownNow()
+        super.handleOnDestroy()
     }
 }
