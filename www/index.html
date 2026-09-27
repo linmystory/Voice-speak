@@ -360,12 +360,18 @@
   let isPaused = false;      // đang ở trạng thái tạm dừng giữa chừng
   let toastTimer = null;
   let keepAliveTimer = null;
+  let nativeSpeaking = false;
+  let initialized = false;
 
   let speechQueue = [];      // mảng các câu/đoạn cần đọc
   let queueIndex = 0;        // đoạn đang đọc / sẽ đọc tiếp
   let currentSessionId = 0;  // để phân biệt phiên đọc cũ khi cancel
 
   const synthSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+
+  // 'web' = dùng Web Speech API của WebView, 'native' = dùng plugin Kotlin (TextToSpeech gốc Android),
+  // 'none' = không có cách nào đọc được trên máy này
+  let ttsMode = 'web';
 
   // ---------- Toast ----------
   function showToast(msg, isError) {
@@ -510,7 +516,7 @@
     voiceSelect.innerHTML = '';
     sorted.forEach(v => {
       const opt = document.createElement('option');
-      opt.value = v.voiceURI;
+      opt.value = v.voiceURI || v.name;
       const flag = isVietnameseVoice(v) ? '🇻🇳 ' : '';
       opt.textContent = flag + v.name + ' (' + v.lang + ')';
       voiceSelect.appendChild(opt);
@@ -522,8 +528,8 @@
   });
 
   function getSelectedVoice() {
-    const uri = voiceSelect.value;
-    return allVoices.find(v => v.voiceURI === uri) || null;
+    const key = voiceSelect.value;
+    return allVoices.find(v => (v.voiceURI || v.name) === key) || null;
   }
 
   // ---------- Speak logic (hàng đợi từng câu) ----------
@@ -619,6 +625,58 @@
     window.speechSynthesis.speak(utterance);
   }
 
+  // ---------- Đọc bằng plugin native (dùng khi WebView không hỗ trợ Web Speech API) ----------
+  async function startSpeakingNative(text) {
+    const plugin = getNativeTtsPlugin();
+    if (!plugin) {
+      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
+      return;
+    }
+    if (!text || !text.trim()) {
+      showToast('Vui lòng nhập văn bản trước khi đọc.', true);
+      return;
+    }
+    if (nativeSpeaking) {
+      return;
+    }
+
+    const voice = getSelectedVoice();
+
+    nativeSpeaking = true;
+    btnSpeak.disabled = true;
+    btnReplay.disabled = true;
+    btnSpeak.classList.add('speaking');
+    btnSpeakIcon.textContent = '⏸';
+    btnSpeakLabel.textContent = 'Đang đọc...';
+    btnStop.disabled = false;
+    statusDot.classList.add('active');
+    statusText.textContent = 'Đang phát âm thanh...';
+
+    try {
+      await plugin.speak({
+        text: text,
+        voiceName: voice ? voice.name : '',
+        lang: voice ? voice.lang : 'vi-VN',
+        rate: parseFloat(rateSelect.value),
+        pitch: parseFloat(pitchSelect.value)
+      });
+      statusText.textContent = 'Đã đọc xong';
+    } catch (err) {
+      const msg = (err && err.message) ? err.message : String(err);
+      showToast('Lỗi khi đọc văn bản: ' + msg, true);
+      statusText.textContent = 'Sẵn sàng';
+    } finally {
+      nativeSpeaking = false;
+      btnSpeak.disabled = false;
+      btnReplay.disabled = false;
+      btnSpeak.classList.remove('speaking');
+      btnSpeakIcon.textContent = '▶️';
+      btnSpeakLabel.textContent = 'ĐỌC VĂN BẢN';
+      btnStop.disabled = true;
+      statusDot.classList.remove('active');
+    }
+  }
+
   function startSpeaking(text) {
     if (!synthSupported) {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
@@ -646,7 +704,11 @@
   }
 
   btnSpeak.addEventListener('click', () => {
-    if (!synthSupported) {
+    if (ttsMode === 'native') {
+      startSpeakingNative(textInput.value);
+      return;
+    }
+    if (ttsMode !== 'web') {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       return;
     }
@@ -679,11 +741,29 @@
       showToast('Vui lòng nhập văn bản trước khi nghe lại.', true);
       return;
     }
+    if (ttsMode === 'native') {
+      startSpeakingNative(text);
+      return;
+    }
     startSpeaking(text);
   });
 
   btnStop.addEventListener('click', () => {
-    if (!synthSupported) return;
+    if (ttsMode === 'native') {
+      const plugin = getNativeTtsPlugin();
+      if (plugin) plugin.stopSpeaking().catch(() => {});
+      nativeSpeaking = false;
+      btnSpeak.disabled = false;
+      btnReplay.disabled = false;
+      btnStop.disabled = true;
+      btnSpeak.classList.remove('speaking');
+      btnSpeakIcon.textContent = '▶️';
+      btnSpeakLabel.textContent = 'ĐỌC VĂN BẢN';
+      statusDot.classList.remove('active');
+      statusText.textContent = 'Đã dừng';
+      return;
+    }
+    if (ttsMode !== 'web') return;
     currentSessionId += 1; // vô hiệu hóa mọi callback đang chờ
     window.speechSynthesis.cancel();
     resetQueueState();
@@ -694,7 +774,7 @@
   // Nếu người dùng chuyển ứng dụng / tắt màn hình, khi quay lại kiểm tra và
   // đồng bộ lại UI cho khớp trạng thái thực tế của engine (tránh kẹt UI).
   document.addEventListener('visibilitychange', () => {
-    if (!synthSupported) return;
+    if (ttsMode !== 'web') return;
     if (document.visibilityState === 'visible') {
       if (!window.speechSynthesis.speaking && isSpeaking) {
         stopKeepAlive();
@@ -755,9 +835,11 @@
         showToast('Đã lưu file âm thanh: ' + (result.fileName || 'audio.wav'));
         // Mở hộp thoại chia sẻ / lưu ngay sau khi tạo xong (tùy chọn, không bắt buộc)
         try {
-          await plugin.shareFile({ uri: result.uri, fileName: result.fileName || 'audio.wav' });
+          if (typeof plugin.shareFile === 'function') {
+            await plugin.shareFile({ uri: result.uri, fileName: result.fileName || 'audio.wav' });
+          }
         } catch (shareErr) {
-          // Người dùng hủy chia sẻ không phải lỗi nghiêm trọng, bỏ qua
+          // Không để lỗi của ứng dụng chia sẻ làm thất bại việc tạo file.
         }
       } else {
         showToast('Không nhận được đường dẫn file sau khi tạo âm thanh.', true);
@@ -770,17 +852,52 @@
   });
 
 
-  function init() {
-    updateCharCount();
-
-    if (!synthSupported) {
-      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ Web Speech API.', true);
+  async function tryNativeFallback() {
+    const plugin = getNativeTtsPlugin();
+    if (!plugin) {
+      showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       btnSpeak.disabled = true;
       btnReplay.disabled = true;
       statusText.textContent = 'Không hỗ trợ đọc giọng nói';
+      ttsMode = 'none';
+      return;
+    }
+    try {
+      const result = await plugin.getVoices();
+      const voices = (result && result.voices) || [];
+      if (voices.length === 0) {
+        showToast('Không tìm thấy giọng đọc nào trên máy. Vào Cài đặt > Ngôn ngữ > Chuyển văn bản thành giọng nói để cài giọng.', true);
+        ttsMode = 'none';
+        return;
+      }
+      ttsMode = 'native';
+      allVoices = voices;
+      voicesByEngine = { 'Bộ đọc hệ thống Android': voices };
+      engineSelect.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.value = 'Bộ đọc hệ thống Android';
+      const viCount = voices.filter(isVietnameseVoice).length;
+      opt.textContent = 'Bộ đọc hệ thống Android' + (viCount > 0 ? ' 🇻🇳 (' + viCount + ' giọng Việt)' : ' (' + voices.length + ' giọng)');
+      engineSelect.appendChild(opt);
+      populateVoiceSelect('Bộ đọc hệ thống Android');
+      statusText.textContent = 'Sẵn sàng';
+    } catch (e) {
+      showToast('Không lấy được danh sách giọng đọc: ' + (e.message || e), true);
+      ttsMode = 'none';
+    }
+  }
+
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    updateCharCount();
+
+    if (!synthSupported) {
+      tryNativeFallback();
       return;
     }
 
+    ttsMode = 'web';
     if (!loadVoices()) {
       // Một số trình duyệt Android cần chờ sự kiện voiceschanged
       window.speechSynthesis.onvoiceschanged = () => {
@@ -788,6 +905,13 @@
       };
       // fallback: thử lại sau 500ms phòng khi sự kiện không bắn
       setTimeout(() => { if (allVoices.length === 0) loadVoices(); }, 500);
+      // Nếu sau 2 giây vẫn không có giọng nào -> WebView không hỗ trợ đầy đủ,
+      // chuyển sang dùng plugin native để đảm bảo app vẫn đọc được
+      setTimeout(() => {
+        if (allVoices.length === 0) {
+          tryNativeFallback();
+        }
+      }, 2000);
     }
   }
 
