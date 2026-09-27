@@ -1,0 +1,8 @@
+node_modules/
+android/
+.DS_Store
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
