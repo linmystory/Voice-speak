@@ -153,6 +153,21 @@ class TtsFileSaverPlugin : Plugin() {
     private val utteranceSeq = AtomicLong(0)
     private fun newUtteranceId(prefix: String): String = "${prefix}_${utteranceSeq.incrementAndGet()}"
 
+    // Đọc tham số số thực (rate/pitch) từ JS một cách chịu lỗi: chấp nhận Int/Long/
+    // Float/Double (JSON của JS gửi 1.0 thành 1, 2.0 thành 2 -> org.json trả Integer)
+    // và cả chuỗi số; NaN/Infinity/thiếu -> dùng giá trị mặc định. Không phụ thuộc
+    // vào việc PluginCall.getFloat() có xử lý đủ các kiểu số hay không, để tốc độ
+    // "1.0x"/"2.0x" không bao giờ bị âm thầm rơi về mặc định.
+    private fun readFloatParam(call: PluginCall, name: String, default: Float): Float {
+        val raw: Any? = try { call.data.opt(name) } catch (_: Throwable) { null }
+        val parsed: Float? = when (raw) {
+            is Number -> raw.toFloat()
+            is String -> raw.trim().toFloatOrNull()
+            else -> null
+        }
+        return if (parsed == null || parsed.isNaN() || parsed.isInfinite()) default else parsed
+    }
+
     // Chờ (có thể bị ngắt) — trả về false nếu người dùng đã bấm Dừng trong lúc chờ.
     private fun sleepUnlessCancelled(ms: Long): Boolean {
         val end = System.currentTimeMillis() + ms
@@ -183,6 +198,21 @@ class TtsFileSaverPlugin : Plugin() {
     // xử lý tuần tự nên đây chính là thời gian tối đa cho 1 đoạn (~800 ký tự);
     // chỉ dùng để phát hiện engine "im lặng" hẳn, không phải giới hạn tốc độ.
     private val FILE_EVENT_TIMEOUT_SEC = 90L
+
+    // Đọc nối liền: xếp trước đoạn kế tiếp vào hàng đợi của engine trong lúc đoạn hiện
+    // tại đang phát (xem vòng đọc trong speak()). false = quay về cách cũ.
+    private val SPEAK_PREFETCH_NEXT = true
+
+    // WakeLock tự hết hạn sau WAKE_LOCK_TIMEOUT_MS; vòng đọc gia hạn mỗi WAKE_LOCK_REFRESH_MS
+    // để bài đọc dài hơn 10 phút (khóa màn hình) không bị Doze làm treo giữa chừng.
+    private val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
+    private val WAKE_LOCK_REFRESH_MS = 60_000L
+
+    // Một đoạn nhỏ của 1 câu cần đọc (danh sách phẳng, theo đúng thứ tự đọc).
+    private class SpeakItem(val sentenceIndex: Int, val subIdx: Int, val text: String)
+
+    // Một đoạn đã gửi cho engine và đang chờ kết quả (xong / lỗi / bị dừng).
+    private class SpeakSlot(val id: String, val latch: CountDownLatch, val outcome: AtomicInteger)
 
     override fun load() {
         super.load()
@@ -287,6 +317,7 @@ class TtsFileSaverPlugin : Plugin() {
         // engine chỉ làm được 1 việc mỗi lúc, nên nếu không dừng đọc trước thì việc
         // lưu file có thể phải chờ hết cả bài đọc (hàng chục phút với văn bản dài)
         // mới bắt đầu — đây là nguyên nhân khiến "lưu âm thanh quá lâu".
+        stopEpoch.incrementAndGet()
         speakCancelled = true
         try { tts?.stop() } catch (_: Throwable) {}
         currentLatch?.countDown()
@@ -306,8 +337,8 @@ class TtsFileSaverPlugin : Plugin() {
 
         val voiceName = call.getString("voiceName") ?: ""
         val lang = call.getString("lang") ?: "vi-VN"
-        val rate = (call.getFloat("rate") ?: 1.0f)
-        val pitch = (call.getFloat("pitch") ?: 1.0f)
+        val rate = readFloatParam(call, "rate", 1.0f)
+        val pitch = readFloatParam(call, "pitch", 1.0f)
 
         runOnExecutor(call) {
             var tmpDir: File? = null
@@ -325,7 +356,9 @@ class TtsFileSaverPlugin : Plugin() {
 
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
                 // Xuất file dùng đoạn LỚN hơn đoạn đọc trực tiếp (xem FILE_CHUNK_LEN).
-                val chunks = splitIntoChunks(text, FILE_CHUNK_LEN)
+                // Bỏ đoạn không có chữ/số nào (cùng lý do như khi đọc qua loa: engine không
+                // gọi callback cho đoạn chỉ gồm dấu câu -> phải chờ hết 90 giây rồi báo lỗi).
+                val chunks = splitIntoChunks(text, FILE_CHUNK_LEN).filter { c -> c.any { it.isLetterOrDigit() } }
                 if (chunks.isEmpty()) {
                     call.reject("Văn bản rỗng sau khi xử lý.")
                     return@runOnExecutor
@@ -389,6 +422,10 @@ class TtsFileSaverPlugin : Plugin() {
                 // 1 đoạn thì bù ngay 1 đoạn mới. Engine không bao giờ phải ngồi
                 // chờ ta nhận callback rồi mới gửi đoạn kế như bản cũ.
                 // ------------------------------------------------------------
+                // Tốc độ chậm -> âm thanh mỗi đoạn dài hơn tỉ lệ nghịch (0.5x = gấp đôi). Với
+                // engine tổng hợp gần theo thời gian thực, mức chờ cố định 90 giây sẽ bị
+                // hết hạn oan ở tốc độ chậm rồi báo "không phản hồi". Chỉ nới khi rate < 1.
+                val eventTimeoutSec = (FILE_EVENT_TIMEOUT_SEC / rate.coerceIn(0.25f, 1.0f)).toLong()
                 val errorAttempts = IntArray(total)
                 val preemptAttempts = IntArray(total)
                 val retryQueue = java.util.ArrayDeque<Int>()
@@ -478,7 +515,7 @@ class TtsFileSaverPlugin : Plugin() {
 
                     // 2) Chờ đúng 1 kết quả (engine xử lý tuần tự nên mỗi lần chỉ xong 1 đoạn).
                     val event = try {
-                        events.poll(FILE_EVENT_TIMEOUT_SEC, TimeUnit.SECONDS)
+                        events.poll(eventTimeoutSec, TimeUnit.SECONDS)
                     } catch (ie: InterruptedException) {
                         Thread.currentThread().interrupt()
                         failMessage = "Quá trình tạo file bị gián đoạn."
@@ -771,6 +808,15 @@ class TtsFileSaverPlugin : Plugin() {
     // (dùng thay cho Web Speech API vì WebView có thể không hỗ trợ đầy đủ)
     // ------------------------------------------------------------------
     @Volatile private var speakCancelled = false
+
+    // Bộ đếm "lệnh Dừng": tăng 1 mỗi khi stopSpeaking()/synthesizeToFile() được gọi.
+    // speak() ghi nhớ giá trị này ngay lúc được gọi; tới khi executor thật sự chạy
+    // tác vụ mà giá trị đã khác nghĩa là người dùng đã bấm Dừng/Lưu SAU khi lệnh đọc
+    // này được gửi -> bỏ lệnh đọc "cũ" đó. Bản cũ đặt lại speakCancelled = false ở
+    // đầu tác vụ nên lệnh Dừng đến sớm bị nuốt mất và app vẫn đọc hết văn bản (dễ
+    // gặp khi đổi tốc độ/giọng liên tiếp hoặc khi executor đang bận việc khác).
+    private val stopEpoch = AtomicInteger(0)
+
     // Giữ tham chiếu tới latch đang chờ, để stopSpeaking() có thể giải phóng
     // ngay lập tức thay vì để executor bị kẹt tới khi hết hạn chờ (fix bug:
     // tts.stop() không đảm bảo callback onDone/onError sẽ được gọi).
@@ -802,11 +848,24 @@ class TtsFileSaverPlugin : Plugin() {
 
         val voiceName = call.getString("voiceName") ?: ""
         val lang = call.getString("lang") ?: "vi-VN"
-        val rate = (call.getFloat("rate") ?: 1.0f)
-        val pitch = (call.getFloat("pitch") ?: 1.0f)
+        val rate = readFloatParam(call, "rate", 1.0f)
+        val pitch = readFloatParam(call, "pitch", 1.0f)
         val warmup = call.getBoolean("warmup") ?: true
+        val epochAtCall = stopEpoch.get()
 
         runOnExecutor(call) {
+            // Đã có lệnh Dừng/Lưu file SAU khi lệnh đọc này được gửi (lúc này mới tới
+            // lượt chạy): coi như đã bị hủy, KHÔNG đọc và KHÔNG đặt lại speakCancelled.
+            if (stopEpoch.get() != epochAtCall) {
+                val stale = JSObject()
+                stale.put("finished", false)
+                stale.put("cancelled", true)
+                stale.put("failed", false)
+                stale.put("failReason", "")
+                stale.put("lastIndex", startIndex)
+                call.resolve(stale)
+                return@runOnExecutor
+            }
             val engine = tts
             if (engine == null) {
                 call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
@@ -845,137 +904,209 @@ class TtsFileSaverPlugin : Plugin() {
                 // gọi lại từng câu.
                 // ------------------------------------------------------------
                 var lastIndexReached = startIndex
-                // Chỉ số câu cuối cùng đã đọc XONG hoàn toàn (mọi đoạn con đều xong).
-                var lastCompletedIndex = startIndex - 1
                 // true nếu phải dừng vì engine liên tục lỗi / liên tục bị chen ngang.
                 var failed = false
                 var failReason = ""
 
-                outer@ for (sentenceIndex in startIndex until sentences.size) {
-                    if (speakCancelled) break@outer
-                    lastIndexReached = sentenceIndex
+                // Gom mọi đoạn con của các câu còn lại thành 1 danh sách phẳng, đúng thứ
+                // tự đọc, để có thể xếp trước đoạn kế tiếp vào hàng đợi của engine.
+                val items = ArrayList<SpeakItem>()
+                for (sentenceIndex in startIndex until sentences.size) {
+                    val parts = splitIntoChunks(sentences[sentenceIndex], SAFE_CHUNK_LEN)
+                    for ((subIdx, partText) in parts.withIndex()) {
+                        // Bỏ đoạn KHÔNG có chữ/số nào (chỉ dấu câu/ký hiệu như "-----", "***"):
+                        // nhiều engine không phát âm gì và cũng KHÔNG gọi onDone/onError cho
+                        // đoạn như vậy, khiến vòng đọc đứng chờ hết thời hạn rồi báo lỗi liên
+                        // tục và dừng cả bài ở đúng chỗ đó.
+                        if (partText.none { it.isLetterOrDigit() }) continue
+                        items.add(SpeakItem(sentenceIndex, subIdx, partText))
+                    }
+                }
+
+                // utteranceId đang chờ kết quả -> (latch, outcome). MỘT listener dùng
+                // chung cho cả phiên (bản cũ gắn listener riêng cho từng đoạn, nên không
+                // thể có 2 đoạn cùng nằm trong hàng đợi). compareAndSet đảm bảo mỗi lần
+                // gửi chỉ có ĐÚNG MỘT kết quả được ghi nhận (callback đến từ luồng
+                // binder, có thể đồng thời/trùng lặp); id không còn trong map thì bỏ qua.
+                val slots = ConcurrentHashMap<String, SpeakSlot>()
+                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    private fun finish(id: String?, result: Int) {
+                        val key = id ?: return
+                        val slot = slots[key] ?: return
+                        if (slot.outcome.compareAndSet(OUTCOME_PENDING, result)) slot.latch.countDown()
+                    }
+                    override fun onStart(id: String?) {}
+                    override fun onDone(id: String?) { finish(id, OUTCOME_DONE) }
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(id: String?) { finish(id, OUTCOME_ERROR) }
+                    override fun onError(id: String?, errorCode: Int) { finish(id, OUTCOME_ERROR) }
+                    // Bị dừng/xoá khỏi hàng đợi: do CHÍNH ta (stopSpeaking) hoặc do bộ đọc
+                    // khác dùng chung engine (TalkBack...) chen ngang bằng QUEUE_DESTROY.
+                    override fun onStop(id: String?, interrupted: Boolean) { finish(id, OUTCOME_STOPPED) }
+                })
+
+                // Đoạn đã nằm trong hàng đợi của engine (theo vị trí trong `items`).
+                val queued = arrayOfNulls<SpeakSlot>(items.size)
+
+                // Gửi đoạn thứ `at` vào hàng đợi engine (QUEUE_ADD). null = engine từ chối ngay.
+                fun submitItem(at: Int): SpeakSlot? {
+                    val item = items[at]
+                    val uid = newUtteranceId("speak_${item.sentenceIndex}_${item.subIdx}")
+                    val slot = SpeakSlot(uid, CountDownLatch(1), AtomicInteger(OUTCOME_PENDING))
+                    slots[uid] = slot
+                    val r = try {
+                        engine.speak(item.text, TextToSpeech.QUEUE_ADD, Bundle(), uid)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "speak() ném lỗi ở câu ${item.sentenceIndex}, đoạn ${item.subIdx}: ${t.message}", t)
+                        TextToSpeech.ERROR
+                    }
+                    if (r != TextToSpeech.SUCCESS) {
+                        slots.remove(uid)
+                        return null
+                    }
+                    return slot
+                }
+
+                var pos = 0
+                var emittedSentence = -1
+                var errorRetries = 0
+                var preemptRetries = 0
+                var lastWakeRefresh = System.currentTimeMillis()
+
+                // Bỏ ghi nhận các đoạn đã xếp hàng ở vị trí `pos` và `pos + 1` (do lỗi/bị
+                // chen ngang) để vòng sau gửi lại ĐÚNG từ `pos`, không đọc lệch thứ tự.
+                fun dropQueued() {
+                    for (k in pos..minOf(pos + 1, items.size - 1)) {
+                        queued[k]?.let { slots.remove(it.id) }
+                        queued[k] = null
+                    }
+                }
+
+                // ------------------------------------------------------------
+                // ĐỌC NỐI LIỀN: trong lúc đoạn `pos` đang phát, đoạn `pos + 1` đã nằm sẵn
+                // trong hàng đợi của engine (QUEUE_ADD). Bản cũ chỉ gửi đoạn kế SAU KHI
+                // nhận onDone của đoạn trước, nên giữa 2 đoạn hàng đợi luôn rỗng một
+                // khoảng ngắn (chờ callback + đánh thức luồng + gọi binder) -> audio
+                // track của engine bị đóng/mở lại -> nghe thấy "khựng" lặp lại mỗi vài
+                // giây (rõ hơn ở tốc độ cao vì đoạn ngắn hơn). Nay engine luôn có sẵn việc
+                // để làm ngay khi vừa xong đoạn trước. Đặt SPEAK_PREFETCH_NEXT = false để
+                // quay về cách cũ (mỗi lần chỉ 1 đoạn trong hàng đợi) nếu cần.
+                // Lỗi/bị chen ngang: bỏ phần đã xếp trước rồi gửi lại từ đoạn lỗi, nên
+                // thứ tự đọc luôn đúng và không đoạn nào bị bỏ sót hay đọc trùng.
+                // ------------------------------------------------------------
+                loop@ while (pos < items.size) {
+                    if (speakCancelled) break@loop
+
+                    // WakeLock tự hết hạn sau 10 phút trong khi bài dài đọc cả chục phút
+                    // (25.000 ký tự ~ 30 phút ở 1.0x, ~60 phút ở 0.5x) -> gia hạn mỗi ~1 phút.
+                    val nowMs = System.currentTimeMillis()
+                    if (nowMs - lastWakeRefresh > WAKE_LOCK_REFRESH_MS) {
+                        acquireWakeLock()
+                        lastWakeRefresh = nowMs
+                    }
+
+                    val item = items[pos]
+                    lastIndexReached = item.sentenceIndex
 
                     // Báo cho JS biết ĐANG bắt đầu đọc câu này (để thanh tiến độ và
                     // vị trí "đọc tiếp" luôn khớp với audio thật đang phát).
-                    try {
-                        val progress = JSObject()
-                        progress.put("index", sentenceIndex)
-                        notifyListeners("speakProgress", progress)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "Không gửi được sự kiện speakProgress: ${t.message}")
-                    }
-
-                    val subChunks = splitIntoChunks(sentences[sentenceIndex], SAFE_CHUNK_LEN)
-                    if (subChunks.isEmpty()) {
-                        lastCompletedIndex = sentenceIndex
-                        continue
-                    }
-
-                    for ((subIdx, chunkText) in subChunks.withIndex()) {
-                        var errorRetries = 0
-                        var preemptRetries = 0
-                        var chunkDone = false
-
-                        // Vòng thử lại cho CHÍNH đoạn này: chỉ sang đoạn kế khi đoạn
-                        // này đã phát xong thật sự (onDone), không bỏ sót nội dung.
-                        while (!chunkDone) {
-                            if (speakCancelled) break@outer
-
-                            val utteranceId = newUtteranceId("speak_${sentenceIndex}_$subIdx")
-                            val latch = CountDownLatch(1)
-                            currentLatch = latch
-                            val outcome = AtomicInteger(OUTCOME_PENDING)
-
-                            // compareAndSet đảm bảo mỗi lần gửi chỉ có ĐÚNG MỘT kết
-                            // quả được ghi nhận (callback đến từ luồng binder, có thể
-                            // đồng thời/trùng lặp).
-                            val listener = object : UtteranceProgressListener() {
-                                override fun onStart(id: String?) {}
-                                override fun onDone(id: String?) {
-                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_DONE)) latch.countDown()
-                                }
-                                @Deprecated("Deprecated in Java")
-                                override fun onError(id: String?) {
-                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) latch.countDown()
-                                }
-                                override fun onError(id: String?, errorCode: Int) {
-                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) latch.countDown()
-                                }
-                                // Bị dừng/xoá khỏi hàng đợi: do CHÍNH ta (stopSpeaking)
-                                // hoặc do bộ đọc khác dùng chung engine (TalkBack...)
-                                // chen ngang bằng QUEUE_DESTROY.
-                                override fun onStop(id: String?, interrupted: Boolean) {
-                                    if (id == utteranceId && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_STOPPED)) latch.countDown()
-                                }
-                            }
-                            engine.setOnUtteranceProgressListener(listener)
-
-                            // Kiểm tra lại speakCancelled NGAY TRƯỚC khi gọi speak()
-                            // thật: stopSpeaking() chạy trên luồng khác nên có 1 khe
-                            // hở cực hẹp; check lại giúp không phát thêm câu thừa
-                            // sau khi người dùng đã bấm Dừng.
-                            if (speakCancelled) break@outer
-                            val result = try {
-                                engine.speak(chunkText, TextToSpeech.QUEUE_ADD, Bundle(), utteranceId)
-                            } catch (t: Throwable) {
-                                Log.e(TAG, "speak() ném lỗi ở câu $sentenceIndex, đoạn $subIdx: ${t.message}", t)
-                                TextToSpeech.ERROR
-                            }
-                            if (result != TextToSpeech.SUCCESS && outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) {
-                                latch.countDown()
-                            }
-
-                            // Thời gian chờ tối đa tỉ lệ với độ dài đoạn và TỐC ĐỘ ĐỌC:
-                            // đọc chậm (0.5x) một đoạn dài có thể mất cả phút, không
-                            // được coi là treo. Chỉ để phát hiện engine "im lặng" hẳn.
-                            val timeoutSec = 20L + (chunkText.length / (5.0f * rate.coerceAtLeast(0.25f))).toLong()
-                            val finished = try {
-                                latch.await(timeoutSec, TimeUnit.SECONDS)
-                            } catch (ie: InterruptedException) {
-                                Thread.currentThread().interrupt()
-                                false
-                            }
-                            currentLatch = null
-
-                            if (speakCancelled) break@outer
-
-                            if (!finished) {
-                                // Engine không phản hồi gì trong suốt thời gian chờ ->
-                                // coi là lỗi, dọn hàng đợi của ta rồi thử lại.
-                                if (outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) {
-                                    try { engine.stop() } catch (_: Throwable) {}
-                                }
-                            }
-
-                            when (outcome.get()) {
-                                OUTCOME_DONE -> chunkDone = true
-                                OUTCOME_STOPPED -> {
-                                    // Bị chen ngang (TalkBack...): xếp lại đúng đoạn này
-                                    // sau một khoảng nghỉ ngắn để bộ đọc kia nói xong.
-                                    preemptRetries++
-                                    if (preemptRetries > MAX_PREEMPT_RETRIES) {
-                                        failed = true
-                                        failReason = "preempted"
-                                        break@outer
-                                    }
-                                    if (!sleepUnlessCancelled(minOf(250L * preemptRetries, 1500L))) break@outer
-                                }
-                                else -> {
-                                    errorRetries++
-                                    if (errorRetries > MAX_ERROR_RETRIES) {
-                                        failed = true
-                                        failReason = "engine_error"
-                                        break@outer
-                                    }
-                                    if (!sleepUnlessCancelled(400L * errorRetries)) break@outer
-                                }
-                            }
+                    if (item.sentenceIndex != emittedSentence) {
+                        emittedSentence = item.sentenceIndex
+                        try {
+                            val progress = JSObject()
+                            progress.put("index", item.sentenceIndex)
+                            notifyListeners("speakProgress", progress)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Không gửi được sự kiện speakProgress: ${t.message}")
                         }
                     }
-                    lastCompletedIndex = sentenceIndex
+
+                    // Kiểm tra lại speakCancelled NGAY TRƯỚC khi gọi speak() thật:
+                    // stopSpeaking() chạy trên luồng khác nên có 1 khe hở cực hẹp; check
+                    // lại giúp không phát thêm câu thừa sau khi người dùng đã bấm Dừng.
+                    if (queued[pos] == null) {
+                        if (speakCancelled) break@loop
+                        queued[pos] = submitItem(pos)
+                    }
+                    if (SPEAK_PREFETCH_NEXT && queued[pos] != null && pos + 1 < items.size && queued[pos + 1] == null) {
+                        if (speakCancelled) break@loop
+                        queued[pos + 1] = submitItem(pos + 1)
+                    }
+
+                    val slot = queued[pos]
+                    var outcome = OUTCOME_ERROR // engine từ chối ngay (slot == null) coi như lỗi
+                    if (slot != null) {
+                        currentLatch = slot.latch
+                        if (speakCancelled) {
+                            currentLatch = null
+                            break@loop
+                        }
+                        // Thời gian chờ tối đa tỉ lệ với độ dài đoạn và TỐC ĐỘ ĐỌC: đọc
+                        // chậm (0.5x) một đoạn dài có thể mất cả phút, không được coi là
+                        // treo. Chỉ để phát hiện engine "im lặng" hẳn.
+                        val timeoutSec = 20L + (item.text.length / (5.0f * rate.coerceAtLeast(0.25f))).toLong()
+                        val finished = try {
+                            slot.latch.await(timeoutSec, TimeUnit.SECONDS)
+                        } catch (ie: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            false
+                        }
+                        currentLatch = null
+                        if (speakCancelled) break@loop
+
+                        if (!finished && slot.outcome.compareAndSet(OUTCOME_PENDING, OUTCOME_ERROR)) {
+                            // Engine không phản hồi gì trong suốt thời gian chờ -> coi là lỗi,
+                            // dọn hàng đợi của ta rồi thử lại.
+                            try { engine.stop() } catch (_: Throwable) {}
+                        }
+                        outcome = slot.outcome.get()
+                        slots.remove(slot.id)
+                    }
+
+                    when (outcome) {
+                        OUTCOME_DONE -> {
+                            queued[pos] = null
+                            errorRetries = 0
+                            preemptRetries = 0
+                            pos++
+                        }
+                        OUTCOME_STOPPED -> {
+                            // Bị chen ngang (TalkBack...): hàng đợi của ta đã bị chính bộ đọc
+                            // kia xoá sạch. KHÔNG gọi engine.stop() ở đây để khỏi cắt lời
+                            // của họ. Xếp lại đúng đoạn này sau một khoảng nghỉ ngắn.
+                            dropQueued()
+                            preemptRetries++
+                            if (preemptRetries > MAX_PREEMPT_RETRIES) {
+                                failed = true
+                                failReason = "preempted"
+                                break@loop
+                            }
+                            if (!sleepUnlessCancelled(minOf(250L * preemptRetries, 1500L))) break@loop
+                        }
+                        else -> {
+                            // Lỗi thật: engine vẫn tiếp tục đọc đoạn đã xếp trước, nên phải
+                            // xoá hàng đợi, nếu không đoạn kế sẽ vang lên TRƯỚC đoạn lỗi
+                            // được gửi lại (đọc lệch thứ tự).
+                            dropQueued()
+                            try { engine.stop() } catch (_: Throwable) {}
+                            errorRetries++
+                            if (errorRetries > MAX_ERROR_RETRIES) {
+                                failed = true
+                                failReason = "engine_error"
+                                break@loop
+                            }
+                            if (!sleepUnlessCancelled(400L * errorRetries)) break@loop
+                        }
+                    }
                 }
 
-                val completedAll = !speakCancelled && !failed && lastCompletedIndex >= sentences.size - 1
+                if (failed) {
+                    // Dừng hẳn do lỗi: xoá nốt đoạn đã xếp trước trong engine, nếu không nó
+                    // vẫn tự đọc tiếp sau khi ta đã báo thất bại cho người dùng.
+                    try { engine.stop() } catch (_: Throwable) {}
+                }
+
+                val completedAll = !speakCancelled && !failed && pos >= items.size
                 try {
                     val done = JSObject()
                     done.put("cancelled", speakCancelled)
@@ -998,12 +1129,19 @@ class TtsFileSaverPlugin : Plugin() {
                 call.resolve(ret)
             } catch (t: Throwable) {
                 Log.e(TAG, "Lỗi khi đọc văn bản: ${t.message}", t)
+                // Đoạn đã xếp trước (nếu có) không được tự đọc tiếp sau khi ta báo lỗi.
+                try { engine.stop() } catch (_: Throwable) {}
                 call.reject("Lỗi khi đọc văn bản: ${t.message}")
             } finally {
                 // Luôn nhả WakeLock khi phiên đọc kết thúc (dù xong xuôi, lỗi
                 // hay bị stopSpeaking() hủy giữa chừng) — không giữ CPU thức
                 // ngoài lúc thật sự cần thiết.
                 releaseWakeLock()
+                // Nhả AudioFocus cả khi đọc XONG TỰ NHIÊN hoặc dừng do lỗi. Bản cũ chỉ
+                // nhả khi bấm Dừng/Lưu/đổi bộ đọc nên sau khi đọc hết bài, app vẫn giữ
+                // focus và nhạc/podcast của app khác bị tạm dừng mãi. Phiên đọc kế tiếp
+                // (kể cả khi đổi tốc độ giữa chừng) tự xin lại focus ở bước warmup.
+                abandonSpeechAudioFocus()
             }
         }
     }
@@ -1011,6 +1149,7 @@ class TtsFileSaverPlugin : Plugin() {
     @PluginMethod
     fun stopSpeaking(call: PluginCall) {
         try {
+            stopEpoch.incrementAndGet()
             speakCancelled = true
             tts?.stop()
             // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
@@ -1137,12 +1276,18 @@ class TtsFileSaverPlugin : Plugin() {
     // an toàn cuối cùng, phòng trường hợp release() vì lý do nào đó không
     // được gọi (ví dụ crash) — không giữ WakeLock vô thời hạn.
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
         try {
+            val held = wakeLock
+            if (held != null && held.isHeld) {
+                // Đang giữ: GIA HẠN. WakeLock không đếm tham chiếu (setReferenceCounted(false))
+                // nên acquire(timeout) lần nữa chỉ đặt lại thời hạn, không giữ chồng.
+                held.acquire(WAKE_LOCK_TIMEOUT_MS)
+                return
+            }
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TtsFileSaverPlugin:speak")
             wl.setReferenceCounted(false)
-            wl.acquire(10 * 60 * 1000L)
+            wl.acquire(WAKE_LOCK_TIMEOUT_MS)
             wakeLock = wl
         } catch (t: Throwable) {
             Log.w(TAG, "Không giữ được WakeLock (bỏ qua, không chặn luồng đọc): ${t.message}")
@@ -1179,9 +1324,10 @@ class TtsFileSaverPlugin : Plugin() {
         }
 
         if (chosenVoice != null) {
+            // Dùng đúng mã trả về của setVoice() (bản cũ bỏ qua nó và luôn coi là
+            // SUCCESS nên nhánh dự phòng setLanguage bên dưới không bao giờ chạy).
             val voiceResult = try {
                 engine.setVoice(chosenVoice)
-                TextToSpeech.SUCCESS
             } catch (t: Throwable) {
                 Log.w(TAG, "setVoice thất bại: ${t.message}")
                 TextToSpeech.ERROR
@@ -1298,7 +1444,11 @@ class TtsFileSaverPlugin : Plugin() {
         val channels: Int,
         val bitsPerSample: Int,
         val byteRate: Int,
-        val blockAlign: Int
+        val blockAlign: Int,
+        // Mã định dạng trong chunk "fmt ": 1 = PCM, 3 = số thực IEEE... (WAVE_FORMAT_EXTENSIBLE
+        // 0xFFFE được quy về mã thật trong SubFormat). Cần giữ đúng khi ghép: bản cũ luôn ghi
+        // nhãn PCM nên dữ liệu số thực/khác bị gắn nhãn sai -> phát ra tiếng nhiễu.
+        val formatTag: Int
     )
 
     private fun readWavInfo(file: File): WavInfo {
@@ -1319,6 +1469,7 @@ class TtsFileSaverPlugin : Plugin() {
             var bitsPerSample = 16
             var byteRate = sampleRate * channels * bitsPerSample / 8
             var blockAlign = channels * bitsPerSample / 8
+            var formatTag = 1
             var dataOffset = -1L
             var dataSize = -1L
 
@@ -1336,6 +1487,11 @@ class TtsFileSaverPlugin : Plugin() {
                         val fmt = ByteArray(chunkSize.toInt())
                         raf.readFully(fmt)
                         if (fmt.size >= 16) {
+                            formatTag = readInt16LE(fmt, 0)
+                            // WAVE_FORMAT_EXTENSIBLE: mã thật nằm ở 2 byte đầu của SubFormat GUID.
+                            if (formatTag == 0xFFFE && fmt.size >= 26) {
+                                formatTag = readInt16LE(fmt, 24)
+                            }
                             channels = readInt16LE(fmt, 2)
                             sampleRate = readInt32LE(fmt, 4)
                             byteRate = readInt32LE(fmt, 8)
@@ -1361,7 +1517,7 @@ class TtsFileSaverPlugin : Plugin() {
             if (dataOffset < 0 || dataSize <= 0) {
                 throw IOException("Không tìm thấy dữ liệu âm thanh hợp lệ trong file: ${file.name}")
             }
-            return WavInfo(dataOffset, dataSize, sampleRate, channels, bitsPerSample, byteRate, blockAlign)
+            return WavInfo(dataOffset, dataSize, sampleRate, channels, bitsPerSample, byteRate, blockAlign, formatTag)
         }
     }
 
@@ -1371,37 +1527,109 @@ class TtsFileSaverPlugin : Plugin() {
     // xác định đúng vị trí nhờ readWavInfo ở trên thay vì offset cố định).
     // Đọc/ghi theo luồng bằng bộ đệm cố định 64KB để tránh nạp cả file vào RAM
     // (an toàn với văn bản dài) mà vẫn ít lệnh đọc/ghi hệ thống hơn hẳn bộ đệm 8KB.
+    //
+    // ĐẢM BẢO TỐC ĐỘ ĐÚNG: header của file ghép chỉ ghi được MỘT tần số lấy mẫu
+    // (của đoạn đầu). Đoạn nào lệch định dạng (tần số/số kênh) được đổi về đúng
+    // định dạng đó bằng WavPcmConverter thay vì nối thẳng — nối thẳng làm đoạn đó
+    // phát NHANH/CHẬM bất thường (bản cũ chỉ ghi cảnh báo rồi vẫn nối). Lệch mà
+    // không đổi được (không phải PCM 16-bit mono/stereo) thì báo lỗi rõ ràng,
+    // không ghi ra file sai một cách âm thầm.
     // ------------------------------------------------------------------
+    private fun isSameWavFormat(a: WavInfo, b: WavInfo): Boolean {
+        return a.sampleRate == b.sampleRate &&
+            a.channels == b.channels &&
+            a.bitsPerSample == b.bitsPerSample &&
+            a.formatTag == b.formatTag
+    }
+
+    // Số byte dữ liệu mà đoạn `info` sẽ đóng góp vào file ghép (đã căn theo khung
+    // và đã tính cả việc đổi định dạng). Dùng để ghi ĐÚNG kích thước vào header
+    // trước khi ghi dữ liệu.
+    private fun mergedDataBytes(info: WavInfo, first: WavInfo): Long {
+        val srcFrameBytes = (info.channels * info.bitsPerSample / 8).coerceAtLeast(1)
+        val srcFrames = info.dataSize / srcFrameBytes
+        if (isSameWavFormat(info, first)) return srcFrames * srcFrameBytes
+        val dstFrameBytes = first.channels * first.bitsPerSample / 8
+        return WavPcmConverter.outputFrames(srcFrames, info.sampleRate, first.sampleRate) * dstFrameBytes
+    }
+
     private fun writeMergedWav(files: List<File>, infos: List<WavInfo>, out: java.io.OutputStream) {
         if (files.isEmpty()) throw IOException("Không có đoạn âm thanh nào để ghép.")
 
         val first = infos[0]
-        // Các đoạn phải cùng định dạng (tần số lấy mẫu/kênh/độ sâu bit) mới ghép
-        // thẳng được; khác nhau thì file ra sẽ bị nhanh/chậm/rè mà không báo lỗi.
+        if (first.sampleRate <= 0 || first.channels <= 0 || first.bitsPerSample <= 0) {
+            throw IOException(
+                "Đoạn âm thanh đầu tiên có định dạng không hợp lệ " +
+                    "(${first.sampleRate}Hz/${first.channels}ch/${first.bitsPerSample}bit)."
+            )
+        }
+
+        // Kiểm tra TRƯỚC khi ghi bất kỳ byte nào: đoạn lệch định dạng phải đổi được.
         for (i in 1 until infos.size) {
             val cur = infos[i]
-            if (cur.sampleRate != first.sampleRate || cur.channels != first.channels || cur.bitsPerSample != first.bitsPerSample) {
-                Log.w(TAG, "Đoạn ${i + 1} có định dạng âm thanh khác đoạn đầu " +
-                    "(${cur.sampleRate}Hz/${cur.channels}ch/${cur.bitsPerSample}bit so với " +
-                    "${first.sampleRate}Hz/${first.channels}ch/${first.bitsPerSample}bit).")
+            if (isSameWavFormat(cur, first)) continue
+            val convertible = cur.formatTag == 1 && first.formatTag == 1 &&
+                cur.bitsPerSample == 16 && first.bitsPerSample == 16 &&
+                cur.channels in 1..2 && first.channels in 1..2 && cur.sampleRate > 0
+            if (!convertible) {
+                throw IOException(
+                    "Đoạn ${i + 1} có định dạng âm thanh " +
+                        "(${cur.sampleRate}Hz/${cur.channels}ch/${cur.bitsPerSample}bit/mã ${cur.formatTag}) khác đoạn đầu " +
+                        "(${first.sampleRate}Hz/${first.channels}ch/${first.bitsPerSample}bit/mã ${first.formatTag}) " +
+                        "và không thể tự đổi. Hãy thử giọng đọc hoặc bộ đọc khác."
+                )
             }
+            Log.w(
+                TAG,
+                "Đoạn ${i + 1} lệch định dạng (${cur.sampleRate}Hz/${cur.channels}ch) so với đoạn đầu " +
+                    "(${first.sampleRate}Hz/${first.channels}ch): tự động đổi để giữ đúng tốc độ."
+            )
         }
-        val totalDataSize = infos.sumOf { it.dataSize }
 
-        writeWavHeader(out, totalDataSize, first.sampleRate, first.channels, first.bitsPerSample, first.byteRate, first.blockAlign)
+        val totalDataSize = infos.sumOf { mergedDataBytes(it, first) }
+        val frameBytes = first.channels * first.bitsPerSample / 8
+        // byteRate/blockAlign tính lại từ chính định dạng sẽ ghi ra, không tin các
+        // trường tương ứng trong header do engine sinh ra.
+        writeWavHeader(
+            out, totalDataSize, first.sampleRate, first.channels, first.bitsPerSample,
+            first.sampleRate * frameBytes, frameBytes, first.formatTag
+        )
+
         val buffer = ByteArray(65536)
         files.forEachIndexed { i, f ->
             val info = infos[i]
-            RandomAccessFile(f, "r").use { raf ->
-                raf.seek(info.dataOffset)
-                var remaining = info.dataSize
-                while (remaining > 0) {
-                    val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                    val n = raf.read(buffer, 0, toRead)
-                    if (n < 0) break
-                    out.write(buffer, 0, n)
-                    remaining -= n
+            if (isSameWavFormat(info, first)) {
+                // Cùng định dạng: chép thẳng, chỉ lấy số byte đã căn theo khung.
+                var remaining = mergedDataBytes(info, first)
+                RandomAccessFile(f, "r").use { raf ->
+                    raf.seek(info.dataOffset)
+                    while (remaining > 0) {
+                        val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                        val n = raf.read(buffer, 0, toRead)
+                        if (n < 0) break
+                        out.write(buffer, 0, n)
+                        remaining -= n
+                    }
                 }
+                if (remaining > 0) {
+                    throw IOException("File tạm của đoạn ${i + 1} bị cụt, không đủ dữ liệu như khai báo.")
+                }
+            } else {
+                // Lệch định dạng: đọc cả đoạn (chỉ vài MB) rồi đổi về định dạng của đoạn đầu.
+                if (info.dataSize > 64L * 1024L * 1024L) {
+                    throw IOException("Đoạn âm thanh ${i + 1} quá lớn để đổi định dạng.")
+                }
+                val srcFrameBytes = info.channels * 2
+                val srcFrames = (info.dataSize / srcFrameBytes).toInt()
+                val src = ByteArray(srcFrames * srcFrameBytes)
+                RandomAccessFile(f, "r").use { raf ->
+                    raf.seek(info.dataOffset)
+                    raf.readFully(src)
+                }
+                WavPcmConverter.convertPcm16(
+                    src, srcFrames, info.channels, info.sampleRate,
+                    first.channels, first.sampleRate, out
+                )
             }
         }
     }
@@ -1413,7 +1641,8 @@ class TtsFileSaverPlugin : Plugin() {
         channels: Int,
         bitsPerSample: Int,
         byteRate: Int,
-        blockAlign: Int
+        blockAlign: Int,
+        formatTag: Int
     ) {
         // WAV chuẩn (RIFF) dùng trường 32-bit cho kích thước, tức tối đa ~4GB.
         // Với văn bản 25.000 ký tự ở tốc độ đọc bình thường, dữ liệu PCM sinh
@@ -1432,7 +1661,7 @@ class TtsFileSaverPlugin : Plugin() {
         writeAscii(header, 8, "WAVE")
         writeAscii(header, 12, "fmt ")
         writeInt32LE(header, 16, 16) // Subchunk1Size cho PCM
-        writeInt16LE(header, 20, 1)  // AudioFormat = 1 (PCM)
+        writeInt16LE(header, 20, formatTag) // AudioFormat: 1 = PCM (hoặc đúng mã của dữ liệu gốc)
         writeInt16LE(header, 22, channels)
         writeInt32LE(header, 24, sampleRate)
         writeInt32LE(header, 28, byteRate)
