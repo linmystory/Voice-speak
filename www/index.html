@@ -2,7 +2,9 @@
 <html lang="vi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<!-- Cho phép phóng to (không khoá maximum-scale/user-scalable): người dùng thị lực kém / TalkBack
+     cần phóng to được; khoá zoom là lỗi trợ năng phổ biến (Lighthouse/WCAG 1.4.4). -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Đọc Văn Bản - Text to Speech</title>
 <style>
   :root {
@@ -36,7 +38,16 @@
   }
 
   body {
-    padding: env(safe-area-inset-top, 16px) 14px calc(env(safe-area-inset-bottom, 16px) + 14px);
+    /* Capacitor 8 nhắm SDK 36 nên Android 15+ hiển thị tràn viền (edge-to-edge). WebView < 140
+       trả SAI giá trị env(safe-area-inset-*) -> thanh trên (nút Cài đặt/Lưu) có thể nằm dưới
+       thanh trạng thái, nội dung cuối nằm dưới thanh điều hướng. Plugin SystemBars của
+       Capacitor bơm biến --safe-area-inset-* đúng; dùng nó làm giá trị ưu tiên, env() dự phòng
+       (đúng mẫu trong tài liệu chính thức của Capacitor). */
+    padding:
+      var(--safe-area-inset-top, env(safe-area-inset-top, 0px))
+      calc(14px + var(--safe-area-inset-right, env(safe-area-inset-right, 0px)))
+      calc(14px + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))
+      calc(14px + var(--safe-area-inset-left, env(safe-area-inset-left, 0px)));
     background:
       radial-gradient(circle at 20% 0%, rgba(0,229,255,0.08), transparent 40%),
       radial-gradient(circle at 100% 30%, rgba(0,229,255,0.05), transparent 50%),
@@ -158,7 +169,7 @@
   .toast {
     position: fixed;
     left: 50%;
-    bottom: calc(env(safe-area-inset-bottom, 16px) + 20px);
+    bottom: calc(var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)) + 20px);
     transform: translateX(-50%) translateY(20px);
     z-index: 200;
     background: #1e2740;
@@ -373,7 +384,7 @@
 
   <div class="card">
     <div class="card-title">📝 Văn bản cần đọc</div>
-    <textarea id="textInput" maxlength="25000" placeholder="Nhập hoặc dán văn bản vào đây (tối đa 25.000 ký tự)..."></textarea>
+    <textarea id="textInput" maxlength="25000" aria-label="Văn bản cần đọc" placeholder="Nhập hoặc dán văn bản vào đây (tối đa 25.000 ký tự)..."></textarea>
     <div class="textarea-footer">
       <span id="charCount">0 / 25.000</span>
       <button class="btn-clear-small" id="btnClearText">🗑 Xóa nhanh</button>
@@ -397,7 +408,8 @@
   <footer>Ứng dụng chạy hoàn toàn ngoại tuyến trên thiết bị của bạn</footer>
 </div>
 
-<div class="toast" id="toast"></div>
+<!-- role/aria-live: để TalkBack tự đọc thông báo (đặc biệt thông báo lỗi); bản cũ im lặng hoàn toàn. -->
+<div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <script>
 (function () {
@@ -460,6 +472,13 @@
   let queueIndex = 0;        // đoạn đang đọc / sẽ đọc tiếp
   let lastQueueText = '';    // văn bản đã dùng để xây speechQueue lần gần nhất
   let currentSessionId = 0;  // để phân biệt phiên đọc cũ khi cancel
+
+  // Cờ chống "chạm đúp": khoảng thời gian từ lúc bấm Phát/Lưu tới lúc giao diện đổi
+  // sang trạng thái đang chạy có các bước await (hỏi trạng thái engine...). Nếu không
+  // chặn, chạm 2 lần liên tiếp gửi 2 lệnh -> đọc trùng hai lần / xuất file hai lần.
+  let startInFlight = false;
+  let saveInFlight = false;
+  const SAVE_LABEL = '💾 Lưu âm thanh';
 
   const synthSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 
@@ -595,7 +614,14 @@
     normalized.split(/\n+/).forEach(line => {
       const trimmedLine = line.trim();
       if (!trimmedLine) return;
-      const matches = trimmedLine.match(/[^.!?…]+[.!?…]*/g);
+      // LỖI ĐÃ SỬA: bản cũ /[^.!?…]+[.!?…]*/g cắt câu tại MỌI dấu chấm, kể cả dấu
+      // chấm nằm giữa số hoặc từ viết tắt ("1.000.000", "3.14", "10.30", "TP.HCM"),
+      // rồi nối các mảnh lại bằng dấu cách -> engine đọc "1. 000. 000" thành
+      // "một, không không không, không không không" thay vì "một triệu". Nay chỉ coi
+      // .!?… là ranh giới câu khi ĐỨNG SAU LÀ khoảng trắng hoặc hết dòng (giống
+      // regex phía Kotlin). Chỉ dùng lookahead (?!...), KHÔNG dùng lookbehind, để
+      // vẫn tương thích WebView Android cũ.
+      const matches = trimmedLine.match(/(?:[^.!?…]|[.!?…](?!\s|$))+[.!?…]*/g);
       if (matches) {
         matches.forEach(m => {
           const t = m.trim();
@@ -636,6 +662,11 @@
 
   // ---------- Load voices ----------
   function loadVoices() {
+    // Khi đã chuyển sang bộ đọc native, danh sách bộ đọc/giọng do plugin cung cấp mới
+    // là nguồn đúng. Sự kiện voiceschanged của Web Speech đến muộn KHÔNG được ghi đè
+    // danh sách đó: nếu ghi đè, tên engine kiểu web ("Google TTS"...) sẽ bị gửi sang
+    // plugin.setEngine() và báo lỗi "không thể chuyển sang bộ đọc đã chọn".
+    if (ttsMode === 'native') return true;
     allVoices = window.speechSynthesis.getVoices() || [];
     if (allVoices.length === 0) return false;
 
@@ -871,6 +902,11 @@
 
     startKeepAlive();
     speakNextChunk(sessionId);
+    // Chuyển giao diện sang "đang đọc" NGAY, không chờ sự kiện onstart (có thể trễ vài
+    // trăm ms): nếu chờ, chạm đúp trong khoảng đó sẽ khởi động lại lần nữa; còn bây giờ
+    // lần chạm thứ 2 được hiểu đúng là "Dừng". onerror sẽ trả giao diện về như cũ.
+    setSpeakingUI(true);
+    updateProgressStatus();
   }
 
   // ---------- Nhánh plugin native ----------
@@ -949,6 +985,13 @@
     // (Dừng/Tua/Lưu file) vô hiệu hóa session này thì bỏ qua, phần code xử lý
     // thao tác đó đã tự cập nhật UI của riêng nó rồi.
     if (sessionId !== currentSessionId) return;
+    // Đọc xong TỰ NHIÊN (không bị hủy, không lỗi): đưa queueIndex ra sau đoạn cuối, giống
+    // nhánh web. Bản cũ để nguyên queueIndex = đoạn cuối (do sự kiện speakProgress) nên
+    // bấm Phát lại sẽ chỉ đọc lại ĐÚNG đoạn cuối thay vì đọc lại từ đầu, và nhãn nút
+    // hiện nhầm "TIẾP TỤC ĐỌC". Phải đặt TRƯỚC setSpeakingUI(false) vì nhãn phụ thuộc nó.
+    if (!(result && (result.failed || result.cancelled))) {
+      queueIndex = speechQueue.length;
+    }
     setSpeakingUI(false);
 
     // Xử lý theo kết quả THẬT trả về (bản cũ luôn báo "Đã đọc xong" bất kể vì
@@ -1014,25 +1057,16 @@
     }
   }
 
-  // Đọc tiếp đúng từ câu đang dừng (queueIndex), dùng chung cho: (1) bấm nút
-  // Phát khi đang ở trạng thái dừng dở, (2) đổi Tốc độ/Cao độ/Giọng đọc TRONG
-  // LÚC đang đọc (xem applySettingsChangeWhileSpeaking bên dưới).
-  function resumeReadingFromCurrentPosition() {
-    if (ttsMode === 'native') {
-      runNativeSpeech(queueIndex, true);
-    } else {
-      currentSessionId += 1;
-      const sessionId = currentSessionId;
-      startKeepAlive();
-      speakNextChunk(sessionId);
-    }
-  }
-
   btnSpeak.addEventListener('click', async () => {
     if (ttsMode !== 'native' && ttsMode !== 'web') {
       showToast('Thiết bị hoặc trình duyệt của bạn không hỗ trợ tính năng đọc giọng nói.', true);
       return;
     }
+
+    // Đang trong bước khởi động (hỏi trạng thái engine...): bỏ qua lần chạm thừa để
+    // không gửi 2 lệnh đọc (sẽ đọc trùng 2 lần). Sau khi giao diện đã chuyển sang ⏹,
+    // lần chạm kế tiếp được hiểu là "Dừng" như bình thường.
+    if (startInFlight) return;
 
     if (isSpeaking) {
       // Đang đọc -> bấm để DỪNG HẲN. Vẫn giữ nguyên queueIndex để bấm lại
@@ -1043,44 +1077,92 @@
       return;
     }
 
-    const text = textInput.value;
-    // Hàng đợi rỗng, đã đọc hết toàn bộ, hoặc văn bản đã bị sửa từ lúc dừng
-    // -> coi như đọc mới hoàn toàn từ đầu.
-    if (speechQueue.length === 0 || queueIndex >= speechQueue.length || text !== lastQueueText) {
-      if (ttsMode === 'native') {
-        await startSpeakingNative(text);
-      } else {
-        startSpeakingWeb(text);
+    startInFlight = true;
+    try {
+      const text = textInput.value;
+      // Hàng đợi rỗng, đã đọc hết toàn bộ, hoặc văn bản đã bị sửa từ lúc dừng
+      // -> coi như đọc mới hoàn toàn từ đầu.
+      if (speechQueue.length === 0 || queueIndex >= speechQueue.length || text !== lastQueueText) {
+        if (ttsMode === 'native') {
+          await startSpeakingNative(text);
+        } else {
+          startSpeakingWeb(text);
+        }
+        return;
       }
-      return;
-    }
 
-    // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
-    // từ câu đang dừng, KHÔNG đọc lại từ đầu.
-    resumeReadingFromCurrentPosition();
+      // Còn dang dở (đã dừng giữa chừng, văn bản không đổi) -> đọc tiếp đúng
+      // từ câu đang dừng, KHÔNG đọc lại từ đầu.
+      if (ttsMode === 'native') {
+        runNativeSpeech(queueIndex, true);
+      } else {
+        currentSessionId += 1;
+        const sessionId = currentSessionId;
+        startKeepAlive();
+        speakNextChunk(sessionId);
+        setSpeakingUI(true);
+        updateProgressStatus();
+      }
+    } finally {
+      startInFlight = false;
+    }
   });
 
-  // ---------- BUG: đổi Tốc độ đọc / Cao độ giọng nói / Giọng đọc TRONG LÚC
-  // đang đọc không có tác dụng gì, phải dừng rồi đọc lại mới thấy đổi ----------
-  // Nguyên nhân: voiceSelect/rateSelect/pitchSelect trước đây KHÔNG có sự kiện
-  // 'change' nào cả — giá trị 3 ô này chỉ được đọc vào đúng thời điểm hàm
-  // speak()/synthesizeToFile() được GỌI (xem runNativeSpeech, speakNextChunk),
-  // nên đổi lựa chọn giữa lúc app đang đọc dở hoàn toàn không được áp dụng,
-  // phải tự bấm Dừng rồi Phát lại mới thấy hiệu lực — đúng hiện tượng "không
-  // điều chỉnh được tốc độ khi đang đọc".
-  // Sửa: đổi 1 trong 3 mục này TRONG LÚC đang đọc -> tự dừng câu hiện tại rồi
-  // đọc tiếp NGAY với thông số mới (câu đang đọc dở sẽ đọc lại từ đầu câu đó,
-  // vì TTS không hỗ trợ tua tới giữa 1 câu đang phát) — cảm giác như đổi có
-  // hiệu lực ngay lập tức thay vì phải tự bấm Dừng/Phát thủ công.
-  async function applySettingsChangeWhileSpeaking() {
-    if (!isSpeaking) return; // chưa đọc -> giá trị mới tự áp dụng ở lần Phát kế tiếp, không cần làm gì
-    await stopCurrentSpeech();
-    resumeReadingFromCurrentPosition();
-  }
-  rateSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
-  pitchSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
-  voiceSelect.addEventListener('change', applySettingsChangeWhileSpeaking);
 
+  // ---------- Đổi Tốc độ / Cao độ / Giọng đọc KHI ĐANG ĐỌC ----------
+  // LỖI ĐÃ SỬA: 3 ô chọn này trước đây KHÔNG có listener nào. Nhánh native chỉ gửi
+  // rate/pitch/voice ĐÚNG 1 LẦN trong plugin.speak() rồi engine đọc hết cả văn
+  // bản với giá trị cũ; nhánh web thì chỉ đổi từ đoạn kế tiếp. Hệ quả: chỉnh tốc
+  // độ giữa chừng thấy "không có tác dụng gì" cho tới khi tự bấm Dừng rồi Phát
+  // lại. Nay: nếu ĐANG đọc thì dừng phiên hiện tại và đọc tiếp NGAY từ đoạn đang
+  // dở với thiết lập mới (không đọc lại từ đầu). Nếu đang dừng thì lần Phát/Tiếp
+  // tục kế tiếp tự lấy giá trị mới như trước.
+  let settingsRestartTimer = null;
+  let settingsRestartRunning = false;
+  let settingsRestartAgain = false;
+
+  function scheduleRestartForNewSettings() {
+    // Gộp nhiều lần đổi liên tiếp thành 1 lần khởi động lại
+    clearTimeout(settingsRestartTimer);
+    settingsRestartTimer = setTimeout(() => {
+      restartSpeechWithNewSettings().catch(err => console.error(err));
+    }, 250);
+  }
+
+  async function restartSpeechWithNewSettings() {
+    if (!isSpeaking) return;
+    if (settingsRestartRunning) { settingsRestartAgain = true; return; }
+    settingsRestartRunning = true;
+    try {
+      do {
+        settingsRestartAgain = false;
+        if (!isSpeaking) break;
+
+        // stopCurrentSpeech() tăng currentSessionId NGAY (đồng bộ) trước khi await,
+        // nên ghi nhận số phiên ngay sau lệnh gọi: nếu trong lúc chờ dừng mà người
+        // dùng bấm Dừng / xoá văn bản (số phiên đổi) thì KHÔNG được tự đọc lại.
+        const stopping = stopCurrentSpeech();
+        const sessionAfterStop = currentSessionId;
+        await stopping;
+        if (currentSessionId !== sessionAfterStop || !isSpeaking) break;
+
+        showToast('Đã áp dụng thiết lập mới, đọc tiếp từ đoạn hiện tại.');
+        if (ttsMode === 'native') {
+          runNativeSpeech(queueIndex, true);
+        } else {
+          currentSessionId += 1;
+          startKeepAlive();
+          speakNextChunk(currentSessionId);
+        }
+      } while (settingsRestartAgain);
+    } finally {
+      settingsRestartRunning = false;
+    }
+  }
+
+  rateSelect.addEventListener('change', scheduleRestartForNewSettings);
+  pitchSelect.addEventListener('change', scheduleRestartForNewSettings);
+  voiceSelect.addEventListener('change', scheduleRestartForNewSettings);
 
   // Nếu người dùng chuyển ứng dụng / tắt màn hình, khi quay lại kiểm tra và
   // đồng bộ lại UI cho khớp trạng thái thực tế của engine (tránh kẹt UI).
@@ -1108,14 +1190,24 @@
     // state: 'idle' | 'processing' | 'disabled'
     btnSaveAudio.classList.toggle('processing', state === 'processing');
     btnSaveAudio.disabled = state === 'processing';
+    // Trong lúc đang tạo file, khoá nút Phát: lệnh đọc sẽ phải xếp hàng SAU việc
+    // tạo file trên cùng 1 luồng engine (có thể vài phút) -> giao diện báo "đang
+    // đọc" nhưng không có tiếng. Mở lại khi xong (trừ khi máy không có bộ đọc nào).
+    btnSpeak.disabled = (state === 'processing') || ttsMode === 'none';
+    // Đổi bộ đọc trong lúc xuất file chỉ bị xếp hàng chờ xuất xong (cùng 1 luồng engine)
+    // và làm giao diện kẹt ở "Đang chuyển bộ đọc..." -> khoá ô chọn bộ đọc tới lúc xong.
+    engineSelect.disabled = (state === 'processing');
     if (state === 'processing') {
       btnSaveAudio.textContent = '⏳ Đang tạo file âm thanh...';
     } else {
-      btnSaveAudio.textContent = '💾 Lưu âm thanh (file WAV)';
+      // Trả về ĐÚNG nhãn gốc: bản cũ đổi thành "(file WAV)" dài hơn làm thanh trên
+      // chật và thu hẹp tiêu đề trên màn hình nhỏ.
+      btnSaveAudio.textContent = SAVE_LABEL;
     }
   }
 
   btnSaveAudio.addEventListener('click', async () => {
+    if (saveInFlight) return; // chặn chạm đúp: chỉ 1 lần xuất file tại 1 thời điểm
     const text = textInput.value;
     if (!text || !text.trim()) {
       showToast('Vui lòng nhập văn bản trước khi lưu âm thanh.', true);
@@ -1128,41 +1220,44 @@
       return;
     }
 
-    // QUAN TRỌNG (khắc phục "lưu âm thanh quá lâu"): app chỉ dùng 1 bộ máy
-    // TTS duy nhất cho cả việc đọc qua loa lẫn xuất file, và bộ máy đó chỉ
-    // làm được 1 việc tại 1 thời điểm. Nếu đang đọc dở mà không dừng trước,
-    // việc lưu file phải NẰM CHỜ đọc xong toàn bộ văn bản rồi mới bắt đầu —
-    // với văn bản dài, cảm giác y hệt "bấm Lưu mà không thấy phản hồi gì".
-    // Phía Kotlin cũng tự ép dừng phòng hờ, nhưng dừng từ đây giúp giao diện
-    // cập nhật NGAY LẬP TỨC thay vì đợi tới lúc đó mới biết.
-    if (isSpeaking) {
-      await stopCurrentSpeech();
-      setSpeakingUI(false);
-    }
-
+    // Khoá nút NGAY (trước mọi bước await bên dưới). Bản cũ chỉ khoá sau khi hỏi xong
+    // trạng thái engine nên chạm 2 lần liên tiếp sẽ xuất 2 file trùng nhau.
+    saveInFlight = true;
+    setSaveButtonState('processing');
     try {
-      const engineStatus = await plugin.getEngineStatus();
-      if (engineStatus && engineStatus.status === 'error') {
-        showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
-        return;
+      // QUAN TRỌNG (khắc phục "lưu âm thanh quá lâu"): app chỉ dùng 1 bộ máy
+      // TTS duy nhất cho cả việc đọc qua loa lẫn xuất file, và bộ máy đó chỉ
+      // làm được 1 việc tại 1 thời điểm. Nếu đang đọc dở mà không dừng trước,
+      // việc lưu file phải NẰM CHỜ đọc xong toàn bộ văn bản rồi mới bắt đầu —
+      // với văn bản dài, cảm giác y hệt "bấm Lưu mà không thấy phản hồi gì".
+      // Phía Kotlin cũng tự ép dừng phòng hờ, nhưng dừng từ đây giúp giao diện
+      // cập nhật NGAY LẬP TỨC thay vì đợi tới lúc đó mới biết.
+      if (isSpeaking) {
+        await stopCurrentSpeech();
+        setSpeakingUI(false);
+        updateProgressStatus();
       }
-      if (engineStatus && engineStatus.status === 'loading') {
-        showToast('Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.', true);
-        return;
+
+      try {
+        const engineStatus = await plugin.getEngineStatus();
+        if (engineStatus && engineStatus.status === 'error') {
+          showToast(engineStatus.message || 'Bộ máy Text-to-Speech gặp lỗi và không sẵn sàng.', true);
+          return;
+        }
+        if (engineStatus && engineStatus.status === 'loading') {
+          showToast('Bộ máy Text-to-Speech đang khởi động, vui lòng thử lại sau vài giây.', true);
+          return;
+        }
+      } catch (e) {
+        // Plugin cũ không có getEngineStatus: bỏ qua bước kiểm tra trước, để
+        // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
       }
-    } catch (e) {
-      // Plugin cũ không có getEngineStatus: bỏ qua bước kiểm tra trước, để
-      // synthesizeToFile() tự báo lỗi nếu engine chưa sẵn sàng.
-    }
 
-    // Đăng ký listener TRƯỚC khi gọi synthesizeToFile(), không sau — nếu đăng
-    // ký sau, sự kiện saveProgress đầu tiên (thường bắn ra rất sớm) có thể lỡ mất.
-    setupNativeListeners();
+      // Đăng ký listener TRƯỚC khi gọi synthesizeToFile(), không sau — nếu đăng
+      // ký sau, sự kiện saveProgress đầu tiên (thường bắn ra rất sớm) có thể lỡ mất.
+      setupNativeListeners();
 
-    const voice = getSelectedVoice();
-
-    try {
-      setSaveButtonState('processing');
+      const voice = getSelectedVoice();
       statusText.textContent = 'Đang tạo file âm thanh…';
       const result = await plugin.synthesizeToFile({
         text: text,
@@ -1172,7 +1267,6 @@
         pitch: parseFloat(pitchSelect.value)
       });
 
-      setSaveButtonState('idle');
       statusText.textContent = 'Sẵn sàng';
 
       if (result && result.uri) {
@@ -1187,10 +1281,13 @@
         showToast('Không nhận được đường dẫn file sau khi tạo âm thanh.', true);
       }
     } catch (err) {
-      setSaveButtonState('idle');
       statusText.textContent = 'Sẵn sàng';
       const msg = (err && err.message) ? err.message : String(err);
       showToast('Lỗi khi tạo file âm thanh: ' + msg, true);
+    } finally {
+      // Luôn mở khoá, kể cả khi thoát sớm bằng return ở các nhánh báo lỗi phía trên.
+      saveInFlight = false;
+      setSaveButtonState('idle');
     }
   });
 
@@ -1231,6 +1328,9 @@
       return;
     }
 
+    // Khoá nút Phát trong lúc liệt kê bộ đọc/giọng (có thể vài giây): chạm vào lúc này
+    // sẽ đi nhầm sang nhánh Web Speech (ttsMode vẫn là 'web', chưa có giọng) -> im lặng.
+    btnSpeak.disabled = true;
     statusText.textContent = 'Đang khởi động bộ đọc...';
 
     try {
@@ -1349,7 +1449,13 @@
     }
   }
 
+  // Chỉ chạy đúng 1 lần: nếu script được nạp khi readyState đã là 'interactive'
+  // thì cả nhánh kiểm tra readyState lẫn sự kiện DOMContentLoaded bên dưới đều
+  // gọi init() -> khởi động engine/liệt kê giọng đọc 2 lần (chậm và trùng lặp).
+  let initialized = false;
   function init() {
+    if (initialized) return;
+    initialized = true;
     try {
       updateCharCount();
 
