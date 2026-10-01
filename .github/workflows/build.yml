@@ -6,9 +6,15 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Quyền tối thiểu cho GITHUB_TOKEN: workflow chỉ cần đọc mã nguồn.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Chặn treo vô hạn (Gradle/mạng) làm chiếm máy chạy và tốn phút Actions.
+    timeout-minutes: 45
     steps:
       - name: Lấy mã nguồn từ repository
         uses: actions/checkout@v5
@@ -74,10 +80,23 @@ jobs:
           sed -i "s/apply plugin: 'com.android.application'/apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'/" android/app/build.gradle
           sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:2.2.20"/}' android/app/build.gradle
 
+      - name: Đặt versionCode / versionName theo số lần chạy workflow
+        # Google Play từ chối AAB có versionCode không lớn hơn bản đã tải lên trước đó.
+        # Template Capacitor luôn đặt versionCode 1 nên chỉ đẩy lên Play được ĐÚNG MỘT lần.
+        # github.run_number tăng dần sau mỗi lần chạy nên luôn hợp lệ. Giữ nguyên cú pháp
+        # (có/không dấu "=") của dòng gốc; nếu không tìm thấy dòng nào thì chỉ in cảnh báo.
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          sed -i -E "s/(versionCode[[:space:]]*=?[[:space:]]*)[0-9]+/\1${RUN_NUMBER}/" android/app/build.gradle
+          sed -i -E "s/(versionName[[:space:]]*=?[[:space:]]*)\"[^\"]*\"/\1\"1.0.${RUN_NUMBER}\"/" android/app/build.gradle
+          grep -n -E "versionCode|versionName" android/app/build.gradle || echo "::warning::Không thấy versionCode/versionName trong android/app/build.gradle"
+
       - name: Copy plugin native (Kotlin) vào project Android
         run: |
           mkdir -p android/app/src/main/java/com/docdoc/app
           cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/TtsFileSaverPlugin.kt
+          cp native-plugin/WavPcmConverter.java android/app/src/main/java/com/docdoc/app/WavPcmConverter.java
           cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/MainActivity.java
 
       - name: Đồng bộ Capacitor
@@ -107,22 +126,53 @@ jobs:
       # khẩu ký vào code vì mọi giá trị đều lấy từ GitHub Secrets, không hề
       # xuất hiện trong log (GitHub tự động che secret trong output).
       # ------------------------------------------------------------------
+      # LỖI ĐÃ SỬA: bản cũ dùng `if: ${{ secrets.KEYSTORE_BASE64 != '' }}`. GitHub
+      # Actions KHÔNG cho dùng ngữ cảnh `secrets` trong `if:` của step — file
+      # workflow bị báo "Unrecognized named-value: 'secrets'" và KHÔNG CHẠY được
+      # (kể cả bản debug). Cách đúng: đọc secret qua `env` của 1 step, ghi cờ vào
+      # $GITHUB_OUTPUT rồi các step sau kiểm tra cờ đó bằng
+      # `steps.signing.outputs.enabled`. Kiểm tra đủ cả 4 secret (bản cũ chỉ kiểm
+      # tra KEYSTORE_BASE64 nên thiếu mật khẩu là build release chết giữa chừng).
+      - name: Kiểm tra đã cấu hình đủ secret ký release chưa
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Chưa cấu hình đủ 4 secret ký release -> bỏ qua build release (bản debug vẫn được tạo)."
+          fi
+
       - name: Giải mã keystore để ký bản release
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > "$GITHUB_WORKSPACE/release-keystore.jks"
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        # Ghi keystore vào thư mục tạm của runner (không nằm trong thư mục mã nguồn).
+        run: echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
 
       - name: Build APK + AAB bản release (đã ký)
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: steps.signing.outputs.enabled == 'true'
+        # Mật khẩu đi qua biến môi trường (không nội suy thẳng vào dòng lệnh) để việc
+        # ký không bị hỏng khi mật khẩu chứa ký tự đặc biệt như dấu nháy kép, $, `.
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           cd android
           ./gradlew assembleRelease bundleRelease \
-            -Pandroid.injected.signing.store.file="$GITHUB_WORKSPACE/release-keystore.jks" \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release-keystore.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
       - name: Tải APK + AAB bản release lên làm "Artifact"
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: app-release-signed
