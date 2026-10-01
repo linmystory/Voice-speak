@@ -1,98 +1,131 @@
 name: Build Android APK
 
+# Chạy tự động mỗi khi có commit mới, hoặc khi bạn tự bấm "Run workflow" trong tab Actions
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-
-permissions:
-  contents: read
+    branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - name: Lấy mã nguồn từ repository
+        uses: actions/checkout@v5
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+      - name: Cài Node.js
+        uses: actions/setup-node@v6
         with:
-          node-version: 20
-          cache: npm
+          node-version: 22
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
+      - name: Cài Java (bắt buộc cho Gradle/Android)
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
-          cache: gradle
+          java-version: 21
 
-      - name: Install npm dependencies
-        run: npm install --no-audit --no-fund
+      - name: Cài các gói phụ thuộc (Capacitor)
+        run: npm install
 
-      - name: Generate Android project
+      - name: Thêm nền tảng Android vào project Capacitor
         run: npx cap add android
 
-      - name: Configure Kotlin for native plugin
-        shell: bash
+      - name: Đặt minSdkVersion = 29 (chỉ hỗ trợ Android 10 trở lên)
+        # Bản này bỏ toàn bộ code xử lý lưu trữ kiểu cũ (WRITE_EXTERNAL_STORAGE +
+        # FileProvider) cho Android 9 trở xuống, chỉ dùng MediaStore/scoped storage
+        # của Android 10+. Do đó BẮT BUỘC nâng minSdkVersion để chặn cài trên máy
+        # cũ hơn — nếu không, tính năng "Lưu âm thanh" sẽ báo lỗi lúc chạy (không
+        # crash cứng, nhưng không dùng được) trên các máy Android 9 trở xuống.
+        # (compileSdkVersion/targetSdkVersion đã tự động = 36 theo template mặc
+        # định của Capacitor 8 — đáp ứng đúng yêu cầu targetSdk 36 của Google Play
+        # có hiệu lực từ 31/8/2026, không cần sed riêng cho 2 giá trị này.)
+        run: sed -i 's/minSdkVersion = [0-9]\+/minSdkVersion = 29/' android/variables.gradle
+
+      - name: Khai báo quyền nhìn thấy TẤT CẢ bộ đọc TTS đã cài + quyền WAKE_LOCK
+        # NGUYÊN NHÂN GỐC của lỗi "không lấy được hết giọng đọc đã cài trên máy":
+        # Từ Android 11 (API 30), hệ thống ẩn bớt danh sách app/dịch vụ khác với
+        # app của mình (package visibility) trừ khi app khai báo rõ mình cần
+        # thấy loại dịch vụ nào qua thẻ <queries> trong AndroidManifest.xml.
+        # TextToSpeech.getEngines() (hàm plugin đang dùng để liệt kê bộ đọc)
+        # chạy nội bộ bằng cách hỏi PackageManager tìm mọi service khai báo
+        # intent-filter "android.intent.action.TTS_SERVICE". Thiếu <queries>
+        # này, PackageManager chỉ trả về những gì "nhìn thấy mặc định" (thường
+        # chỉ có Google TTS/engine mặc định hệ thống) — các bộ đọc khác người
+        # dùng đã cài (Samsung TTS, engine hãng thứ 3, v.v.) bị ẩn đi hoàn
+        # toàn, dẫn đến app không sao lấy được voices của chúng dù đã cài.
+        #
+        # QUYỀN WAKE_LOCK: cần để TtsFileSaverPlugin.kt giữ CPU thức (PARTIAL_
+        # WAKE_LOCK) trong suốt phiên đọc dài — nếu không có quyền này, khi
+        # người dùng khóa màn hình giữa lúc đang đọc, Android có thể đưa CPU
+        # vào Doze làm luồng đọc bị treo, gây audio ngắt giữa chừng. Đây là
+        # quyền "normal" (không nguy hiểm), chỉ cần khai báo trong manifest,
+        # KHÔNG cần xin runtime.
+        #
+        # Cả 2 đều chèn ngay sau thẻ <manifest ...> mở đầu, làm sibling của
+        # <application>, TRƯỚC khi cap sync/build.
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
+          sed -i '/<manifest /a\    <uses-permission android:name="android.permission.WAKE_LOCK" />\n    <queries>\n        <intent>\n            <action android:name="android.intent.action.TTS_SERVICE" />\n        </intent>\n    </queries>' android/app/src/main/AndroidManifest.xml
+          echo "----- AndroidManifest.xml sau khi vá -----"
+          cat android/app/src/main/AndroidManifest.xml
 
-          root = Path('android/build.gradle')
-          text = root.read_text(encoding='utf-8')
-          kotlin_line = 'classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24"'
-          if kotlin_line not in text:
-              marker = 'dependencies {'
-              if marker not in text:
-                  raise SystemExit('Cannot find root Gradle dependencies block.')
-              text = text.replace(marker, marker + '\n        ' + kotlin_line, 1)
-              root.write_text(text, encoding='utf-8')
+      - name: Bật hỗ trợ biên dịch Kotlin cho project Android
+        run: |
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.20"/}' android/build.gradle
+          sed -i "s/apply plugin: 'com.android.application'/apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'/" android/app/build.gradle
+          sed -i '0,/dependencies {/{s/dependencies {/dependencies {\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:2.2.20"/}' android/app/build.gradle
 
-          app = Path('android/app/build.gradle')
-          text = app.read_text(encoding='utf-8')
-          if "apply plugin: 'kotlin-android'" not in text:
-              marker = "apply plugin: 'com.android.application'"
-              if marker not in text:
-                  raise SystemExit('Cannot find Android application plugin declaration.')
-              text = text.replace(marker, marker + "\napply plugin: 'kotlin-android'", 1)
-          if 'kotlin-stdlib:1.9.24' not in text:
-              marker = 'dependencies {'
-              if marker not in text:
-                  raise SystemExit('Cannot find app Gradle dependencies block.')
-              text = text.replace(
-                  marker,
-                  marker + '\n    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.9.24"',
-                  1,
-              )
-          app.write_text(text, encoding='utf-8')
-          PY
-
-      - name: Install native Android plugin
-        shell: bash
+      - name: Copy plugin native (Kotlin) vào project Android
         run: |
           mkdir -p android/app/src/main/java/com/docdoc/app
           cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/TtsFileSaverPlugin.kt
           cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/MainActivity.java
 
-      - name: Sync Capacitor
+      - name: Đồng bộ Capacitor
         run: npx cap sync android
 
-      - name: Build debug APK
-        working-directory: android
-        run: ./gradlew --no-daemon --stacktrace assembleDebug
+      - name: Build file APK (bản debug, để cài thử ngay)
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
 
-      - name: Verify APK exists
-        run: test -s android/app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - name: Tải APK lên làm "Artifact" để tải về
+        uses: actions/upload-artifact@v6
         with:
-          name: doc-van-ban-tts-debug-apk
+          name: app-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
+
+      # ------------------------------------------------------------------
+      # BUILD BẢN RELEASE (đã ký) — CHỈ chạy khi đã cấu hình đủ 4 secret dưới
+      # đây trong Settings > Secrets and variables > Actions của repo:
+      #   KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+      # Chưa cấu hình thì các bước này tự bỏ qua (không làm hỏng build debug
+      # ở trên) — xem HUONG_DAN_CAI_DAT.md để biết cách tạo keystore + thêm
+      # secret. Dùng -Pandroid.injected.signing.* (property nội bộ do chính
+      # Android Gradle Plugin nhận diện) để ký thẳng lúc build mà KHÔNG cần
+      # thêm khối signingConfigs vào build.gradle — không có nguy cơ lộ mật
+      # khẩu ký vào code vì mọi giá trị đều lấy từ GitHub Secrets, không hề
+      # xuất hiện trong log (GitHub tự động che secret trong output).
+      # ------------------------------------------------------------------
+      - name: Giải mã keystore để ký bản release
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > "$GITHUB_WORKSPACE/release-keystore.jks"
+
+      - name: Build APK + AAB bản release (đã ký)
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        run: |
+          cd android
+          ./gradlew assembleRelease bundleRelease \
+            -Pandroid.injected.signing.store.file="$GITHUB_WORKSPACE/release-keystore.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+
+      - name: Tải APK + AAB bản release lên làm "Artifact"
+        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-release-signed
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
