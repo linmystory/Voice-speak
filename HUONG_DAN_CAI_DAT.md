@@ -1,5 +1,65 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
+> **Cập nhật v2.6 — rà soát lần 2, sửa các lỗi còn tồn đọng:**
+> - **Đọc nối liền, hết "khựng" giữa các đoạn:** bản cũ chỉ gửi đoạn kế sau khi
+>   đoạn trước báo xong nên hàng đợi của engine luôn rỗng một khoảng ngắn giữa 2
+>   đoạn (rõ hơn ở tốc độ cao). Nay đoạn kế được xếp sẵn vào hàng đợi trong lúc
+>   đoạn hiện tại đang phát; lỗi/bị TalkBack chen ngang thì tự xếp lại đúng thứ
+>   tự. **Nếu một bộ đọc lạ bị đọc lặp/lệch**, mở `native-plugin/TtsFileSaverPlugin.kt`,
+>   đổi `SPEAK_PREFETCH_NEXT = true` thành `false` rồi build lại để quay về cách cũ.
+> - **Đọc xong rồi bấm Phát lại** giờ đọc lại từ ĐẦU (bản cũ chỉ đọc lại đúng đoạn
+>   cuối và nhãn nút hiện nhầm "TIẾP TỤC ĐỌC").
+> - **Chạm đúp nút Phát / Lưu** không còn đọc trùng 2 lần hay xuất 2 file giống nhau.
+> - **Đoạn chỉ gồm dấu câu/ký hiệu** (ví dụ `-----`, `***`) không còn làm cả bài
+>   đứng chờ rồi dừng với lỗi (engine không gọi callback cho đoạn không có chữ).
+> - **Bài đọc dài hơn 10 phút khi khóa màn hình:** WakeLock tự hết hạn sau 10
+>   phút nên CPU có thể bị Doze làm treo; nay được gia hạn mỗi ~1 phút.
+> - **Ghép WAV giữ đúng loại định dạng** (PCM / số thực...) thay vì luôn gắn nhãn PCM.
+> - **Giao diện:** vùng an toàn (safe area) theo đúng khuyến nghị Capacitor 8 để
+>   nút Cài đặt/Lưu không nằm dưới thanh trạng thái trên Android 15+ (WebView < 140
+>   trả sai `env()`); cho phép phóng to màn hình; TalkBack đọc được thông báo
+>   (toast); ô nhập có nhãn; nút Lưu giữ đúng nhãn gốc; khoá ô chọn bộ đọc trong
+>   lúc đang xuất file.
+> - **`build.yml`:** `versionCode`/`versionName` tự tăng theo số lần chạy workflow
+>   (trước đây luôn là 1 nên Google Play chỉ nhận được đúng 1 lần tải lên);
+>   giới hạn 45 phút/lần chạy.
+>
+> **Cập nhật v2.5 — sửa lỗi điều chỉnh tốc độ âm thanh + rà soát lỗi chung:**
+> - **Đổi Tốc độ / Cao độ / Giọng đọc khi ĐANG đọc giờ có tác dụng ngay:** trước
+>   đây 3 ô chọn này không có bộ lắng nghe nào — app chỉ gửi giá trị cho bộ đọc
+>   đúng 1 lần lúc bấm Phát, nên đổi giữa chừng "không thấy gì xảy ra" cho tới
+>   khi tự bấm Dừng rồi Phát lại. Nay app tự dừng và đọc tiếp **đúng từ đoạn đang
+>   dở** (không đọc lại từ đầu) với thiết lập mới; đổi liên tiếp nhiều lần được
+>   gộp thành 1 lần; bấm Dừng ngay sau khi đổi sẽ không tự đọc lại.
+> - **File WAV ghép từ nhiều đoạn không còn đoạn nào bị nhanh/chậm bất thường:**
+>   header WAV chỉ ghi được 1 tần số lấy mẫu (của đoạn đầu). Bản cũ gặp đoạn có
+>   tần số khác (ví dụ 22050 Hz so với 24000 Hz) chỉ ghi cảnh báo rồi vẫn nối
+>   thẳng, nên đoạn đó phát lại nhanh hơn/chậm hơn và đổi cao độ mà không báo lỗi.
+>   Nay đoạn lệch được đổi về đúng định dạng đoạn đầu bằng file mới
+>   `native-plugin/WavPcmConverter.java` (nội suy tuyến tính, PCM 16-bit
+>   mono/stereo); định dạng không đổi được thì báo lỗi rõ ràng thay vì ghi sai.
+> - **Chờ kết quả khi xuất file co giãn theo tốc độ:** tốc độ chậm làm âm thanh
+>   mỗi đoạn dài hơn nên mức chờ tối đa được nới tương ứng (không còn báo "không
+>   phản hồi" oan với engine tổng hợp gần theo thời gian thực).
+> - **Số và dấu chấm:** "1.000.000", "3.14" không còn bị tách thành "1. 000. 000"
+>   rồi đọc sai; chỉ coi dấu chấm là hết câu khi theo sau là khoảng trắng/hết dòng.
+> - **Lệnh Dừng không còn bị "nuốt":** nếu bấm Dừng/Lưu file trước khi lệnh đọc
+>   đang xếp hàng kịp chạy thì lệnh đọc đó bị hủy đúng (bản cũ vẫn đọc hết văn bản).
+> - **Nhả AudioFocus khi đọc xong tự nhiên** (bản cũ chỉ nhả khi bấm Dừng nên
+>   nhạc/podcast của app khác bị tạm dừng mãi); nút Phát bị khoá trong lúc đang
+>   tạo file; `init()` chỉ chạy 1 lần; sự kiện `voiceschanged` đến muộn không
+>   ghi đè danh sách bộ đọc native; nhánh dự phòng `setLanguage` giờ chạy thật
+>   khi `setVoice()` thất bại (bản cũ luôn coi là thành công).
+> - **Sửa `.github/workflows/build.yml` (quan trọng):** bản cũ dùng
+>   `if: ${{ secrets.KEYSTORE_BASE64 != '' }}` — GitHub **không cho** dùng ngữ
+>   cảnh `secrets` trong `if:` của step (báo `Unrecognized named-value:
+>   'secrets'`, workflow không chạy được). Nay secret đi qua một bước kiểm tra
+>   riêng, kiểm tra đủ cả 4 secret; mật khẩu ký truyền qua biến môi trường; keystore
+>   giải mã vào thư mục tạm của runner; `GITHUB_TOKEN` chỉ còn quyền đọc.
+> - **Nhớ build lại APK** sau khi cập nhật — bản vá chỉ có hiệu lực từ lần build mới.
+>   Workflow tự copy thêm `WavPcmConverter.java`; nếu build thủ công (Cách 2) hãy
+>   copy đủ **cả 3 file** trong `native-plugin/`.
+
 > **Cập nhật v2.4 — sửa xung đột TalkBack, tăng tốc lưu file, sửa lỗi không dừng khi xoá văn bản:**
 > - **Xung đột với TalkBack (hoặc bất kỳ app nào dùng chung 1 bộ đọc):** khi 2 ứng
 >   dụng cùng dùng chung một engine TTS, TalkBack giành quyền nói bằng cách xoá
@@ -80,7 +140,7 @@ thêm**:
   cài trên máy, bắt buộc từ Android 11+) và quyền `WAKE_LOCK` (để không bị
   ngắt âm thanh khi khóa màn hình giữa lúc đọc dài)
 - Bật hỗ trợ biên dịch Kotlin
-- Copy plugin `TtsFileSaverPlugin.kt` và `MainActivity.java` vào đúng vị trí
+- Copy plugin `TtsFileSaverPlugin.kt`, `WavPcmConverter.java` và `MainActivity.java` vào đúng vị trí
 - Build file APK bản debug (luôn chạy) + APK/AAB bản release đã ký (chỉ chạy
   nếu đã cấu hình đủ 4 secret ở mục ngay dưới đây — nếu chưa, workflow tự bỏ
   qua các bước này, không làm hỏng bản debug)
@@ -153,6 +213,7 @@ sed -i '/<manifest /a\    <uses-permission android:name="android.permission.WAKE
 # Copy plugin native vào project
 mkdir -p android/app/src/main/java/com/docdoc/app
 cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/
+cp native-plugin/WavPcmConverter.java android/app/src/main/java/com/docdoc/app/
 cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/
 
 npx cap sync android
@@ -219,6 +280,22 @@ Việt:** Máy chưa cài gói giọng tiếng Việt cho engine TTS đang dùng
 đã được vá để tự động rơi về tiếng Anh (thay vì lỗi hẳn) khi ngôn ngữ yêu
 cầu không có sẵn — hãy cài thêm giọng tiếng Việt theo hướng dẫn ở mục
 "Không có bộ đọc khả dụng" phía trên để giọng đọc đúng như mong muốn.
+
+**Đọc bị lặp một đoạn / lệch thứ tự ở một số bộ đọc (sau v2.6):**
+1. Nguyên nhân hiếm gặp: bộ đọc làm mất callback "xong" của một đoạn trong khi
+   vẫn đọc tiếp đoạn xếp sẵn. Mở `native-plugin/TtsFileSaverPlugin.kt`, đổi
+   `SPEAK_PREFETCH_NEXT = true` thành `false`, build lại APK — app quay về cách
+   cũ (mỗi lần chỉ 1 đoạn trong hàng đợi, có thể khựng nhẹ giữa các đoạn).
+
+**Đổi tốc độ đọc nhưng không thấy thay đổi / file lưu có đoạn nhanh-chậm lạ:**
+1. Từ v2.5, đổi Tốc độ/Cao độ/Giọng khi đang đọc sẽ áp dụng ngay (có thông báo
+   "Đã áp dụng thiết lập mới"), kèm khoảng lặng ngắn (~0,3 giây) lúc khởi động
+   lại bộ đọc. Nếu không thấy gì, hãy chắc chắn đã **build lại APK** từ v2.5.
+2. Một số engine TTS bên thứ 3 bỏ qua hoặc giới hạn hệ số tốc độ (ví dụ chỉ
+   hỗ trợ tới khoảng 2x) — thử đổi sang Google TTS trong menu ⚙️ để đối chiếu.
+3. Nếu app báo "Đoạn N có định dạng âm thanh khác đoạn đầu và không thể tự đổi"
+   khi lưu file: engine đang xuất định dạng không phải PCM 16-bit — hãy chọn
+   bộ đọc/giọng khác rồi lưu lại.
 
 **Âm thanh vẫn mất tiếng đầu câu hoặc ngắt quãng dù đã cập nhật v2.3:**
 Từ v2.3, app đã xin `AudioFocus` tường minh, giữ `WakeLock`, và đọc liên tục
