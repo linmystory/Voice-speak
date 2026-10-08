@@ -1,5 +1,24 @@
 # Hướng dẫn cài đặt & build ứng dụng "Đọc Văn Bản" (TTS)
 
+> **Cập nhật v2.7 — chỉnh tốc độ giờ có tác dụng với MỌI bộ đọc (không chỉ Google):**
+> - **Nguyên nhân:** app chỉ "nhờ" bộ đọc đổi tốc độ qua `setSpeechRate()` của Android. Đây
+>   chỉ là một yêu cầu — bộ đọc Google làm đúng, còn nhiều bộ đọc khác bỏ qua hoặc chỉ làm
+>   một phần, nên chỉnh tốc độ trong app "không có tác dụng gì". (Không phải lỗi mã nguồn
+>   của app; mọi lần gọi `setSpeechRate()` đều đúng.)
+> - **Cách sửa:** app tự **đo** — tổng hợp một câu mẫu ở tốc độ 1.0 và ở tốc độ bạn chọn
+>   rồi so thời lượng (~1–2 giây, chỉ ở lần đầu cho mỗi bộ đọc/giọng/tốc độ). Bộ đọc làm
+>   đúng (Google) thì **giữ nguyên** cách đọc cũ. Bộ đọc không làm đúng thì app tự đổi tốc
+>   độ bằng phần mềm (thuật toán WSOLA, **giữ nguyên cao độ**) cho cả **đọc trực tiếp** lẫn
+>   **lưu file WAV**, và hiện thông báo "app điều chỉnh bằng phần mềm (×…)".
+> - Các file mới trong `native-plugin/`: `SoftwareSpeed.java` (thuật toán + đọc/ghi WAV) và
+>   `SpeedAudioPlayer.java` (phát bằng AudioTrack, nối liền các đoạn). Workflow tự copy; nếu
+>   build thủ công hãy copy đủ **5 file** trong `native-plugin/`.
+> - Nếu tốc độ phần mềm trục trặc trên một máy cụ thể (không phát được, rè...), app tự quay
+>   về cách đọc cũ và báo rõ. Muốn tắt hẳn: đổi `SOFTWARE_SPEED_ENABLED = true` thành `false`
+>   trong `TtsFileSaverPlugin.kt` rồi build lại.
+> - Lưu ý: chỉ **tốc độ** được xử lý bằng phần mềm; **cao độ** vẫn do bộ đọc tự thực hiện
+>   nên cũng có thể không có tác dụng với các bộ đọc bỏ qua `setPitch()`.
+>
 > **Cập nhật v2.6 — rà soát lần 2, sửa các lỗi còn tồn đọng:**
 > - **Đọc nối liền, hết "khựng" giữa các đoạn:** bản cũ chỉ gửi đoạn kế sau khi
 >   đoạn trước báo xong nên hàng đợi của engine luôn rỗng một khoảng ngắn giữa 2
@@ -58,7 +77,7 @@
 >   giải mã vào thư mục tạm của runner; `GITHUB_TOKEN` chỉ còn quyền đọc.
 > - **Nhớ build lại APK** sau khi cập nhật — bản vá chỉ có hiệu lực từ lần build mới.
 >   Workflow tự copy thêm `WavPcmConverter.java`; nếu build thủ công (Cách 2) hãy
->   copy đủ **cả 3 file** trong `native-plugin/`.
+>   copy đủ **cả 5 file** trong `native-plugin/`.
 
 > **Cập nhật v2.4 — sửa xung đột TalkBack, tăng tốc lưu file, sửa lỗi không dừng khi xoá văn bản:**
 > - **Xung đột với TalkBack (hoặc bất kỳ app nào dùng chung 1 bộ đọc):** khi 2 ứng
@@ -140,7 +159,7 @@ thêm**:
   cài trên máy, bắt buộc từ Android 11+) và quyền `WAKE_LOCK` (để không bị
   ngắt âm thanh khi khóa màn hình giữa lúc đọc dài)
 - Bật hỗ trợ biên dịch Kotlin
-- Copy plugin `TtsFileSaverPlugin.kt`, `WavPcmConverter.java` và `MainActivity.java` vào đúng vị trí
+- Copy plugin `TtsFileSaverPlugin.kt`, `WavPcmConverter.java`, `SoftwareSpeed.java`, `SpeedAudioPlayer.java` và `MainActivity.java` vào đúng vị trí
 - Build file APK bản debug (luôn chạy) + APK/AAB bản release đã ký (chỉ chạy
   nếu đã cấu hình đủ 4 secret ở mục ngay dưới đây — nếu chưa, workflow tự bỏ
   qua các bước này, không làm hỏng bản debug)
@@ -214,6 +233,8 @@ sed -i '/<manifest /a\    <uses-permission android:name="android.permission.WAKE
 mkdir -p android/app/src/main/java/com/docdoc/app
 cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/
 cp native-plugin/WavPcmConverter.java android/app/src/main/java/com/docdoc/app/
+cp native-plugin/SoftwareSpeed.java android/app/src/main/java/com/docdoc/app/
+cp native-plugin/SpeedAudioPlayer.java android/app/src/main/java/com/docdoc/app/
 cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/
 
 npx cap sync android
@@ -286,6 +307,14 @@ cầu không có sẵn — hãy cài thêm giọng tiếng Việt theo hướng 
    vẫn đọc tiếp đoạn xếp sẵn. Mở `native-plugin/TtsFileSaverPlugin.kt`, đổi
    `SPEAK_PREFETCH_NEXT = true` thành `false`, build lại APK — app quay về cách
    cũ (mỗi lần chỉ 1 đoạn trong hàng đợi, có thể khựng nhẹ giữa các đoạn).
+
+**Tốc độ chỉ đổi với bộ đọc Google, các bộ đọc khác không đổi (sau v2.7 vẫn vậy):**
+1. Hãy chắc chắn đã build lại APK từ v2.7. Khi đổi tốc độ lần đầu với một bộ đọc, app mất
+   ~1–2 giây để đo, rồi hiện thông báo "app điều chỉnh bằng phần mềm" nếu cần.
+2. Nếu thấy thông báo "Không chỉnh được tốc độ bằng phần mềm trên máy này": bộ đọc xuất âm
+   thanh không phải PCM 16-bit, hoặc thiết bị không tạo được AudioTrack — hãy dùng bộ đọc Google.
+3. Tốc độ phần mềm ở mức rất nhanh (2.0×) có thể nghe hơi "dẹt" hơn so với bộ đọc tự xử lý;
+   đó là giới hạn của kỹ thuật co giãn thời gian. Chọn mức 1.25×–1.5× để nghe tự nhiên hơn.
 
 **Đổi tốc độ đọc nhưng không thấy thay đổi / file lưu có đoạn nhanh-chậm lạ:**
 1. Từ v2.5, đổi Tốc độ/Cao độ/Giọng khi đang đọc sẽ áp dụng ngay (có thông báo
