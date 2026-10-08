@@ -97,6 +97,8 @@ jobs:
           mkdir -p android/app/src/main/java/com/docdoc/app
           cp native-plugin/TtsFileSaverPlugin.kt android/app/src/main/java/com/docdoc/app/TtsFileSaverPlugin.kt
           cp native-plugin/WavPcmConverter.java android/app/src/main/java/com/docdoc/app/WavPcmConverter.java
+          cp native-plugin/SoftwareSpeed.java android/app/src/main/java/com/docdoc/app/SoftwareSpeed.java
+          cp native-plugin/SpeedAudioPlayer.java android/app/src/main/java/com/docdoc/app/SpeedAudioPlayer.java
           cp native-plugin/MainActivity.java android/app/src/main/java/com/docdoc/app/MainActivity.java
 
       - name: Đồng bộ Capacitor
