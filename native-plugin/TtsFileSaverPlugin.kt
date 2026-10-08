@@ -212,7 +212,30 @@ class TtsFileSaverPlugin : Plugin() {
     private class SpeakItem(val sentenceIndex: Int, val subIdx: Int, val text: String)
 
     // Một đoạn đã gửi cho engine và đang chờ kết quả (xong / lỗi / bị dừng).
-    private class SpeakSlot(val id: String, val latch: CountDownLatch, val outcome: AtomicInteger)
+    // `file` != null khi đang ở chế độ tốc độ phần mềm: engine chỉ tổng hợp ra file này.
+    private class SpeakSlot(val id: String, val latch: CountDownLatch, val outcome: AtomicInteger, val file: File?)
+
+    // ------------------------------------------------------------------
+    // TỐC ĐỘ BẰNG PHẦN MỀM. App chỉ "nhờ" engine đổi tốc độ qua setSpeechRate(); đó chỉ là
+    // một yêu cầu — engine Google làm đúng nhưng nhiều engine khác bỏ qua hoặc chỉ làm một
+    // phần, khi đó chỉnh tốc độ trong app "không có tác dụng gì". Nên app ĐO THỰC TẾ (tổng
+    // hợp một câu mẫu ở tốc độ 1.0 và tốc độ yêu cầu, so thời lượng) rồi tự bù phần còn
+    // thiếu bằng SoftwareSpeed (WSOLA, giữ nguyên cao độ). Engine làm đúng (Google) thì
+    // KHÔNG bị đụng tới: vẫn dùng đường đọc trực tiếp như trước.
+    // ------------------------------------------------------------------
+    private val SOFTWARE_SPEED_ENABLED = true
+    // Chờ tối đa cho mỗi lần đo; engine không phản hồi thì bỏ qua (giữ hành vi cũ) thay vì bắt người dùng chờ lâu.
+    private val PROBE_TIMEOUT_SEC = 8L
+    private val PROBE_TEXT_VI = "Xin chào các bạn. Đây là câu đọc thử dùng để kiểm tra tốc độ giọng nói của bộ đọc."
+    private val PROBE_TEXT_EN = "Hello everyone. This is a short sample sentence used to check the speaking speed of this voice."
+    // "engine|giọng" -> thời lượng có tiếng ở tốc độ 1.0 (đo 1 lần, dùng lại cho mọi tốc độ khác)
+    private val speedBaseSeconds = ConcurrentHashMap<String, Double>()
+    // "engine|giọng|tốc độ" -> hệ số cần bù bằng phần mềm (1.0 = engine đã tự làm đúng)
+    private val speedResidualCache = ConcurrentHashMap<String, Float>()
+    // đo thất bại liên tiếp -> thôi không đo nữa, coi như engine làm đúng (giữ hành vi cũ)
+    private val speedProbeFails = ConcurrentHashMap<String, Int>()
+    // Bộ phát âm thanh đang dùng (nút Dừng gọi abortAsync() để tắt tiếng ngay)
+    @Volatile private var activePlayer: SpeedAudioPlayer? = null
 
     override fun load() {
         super.load()
@@ -320,6 +343,7 @@ class TtsFileSaverPlugin : Plugin() {
         stopEpoch.incrementAndGet()
         speakCancelled = true
         try { tts?.stop() } catch (_: Throwable) {}
+        try { activePlayer?.abortAsync() } catch (_: Throwable) {}
         currentLatch?.countDown()
         abandonSpeechAudioFocus()
 
@@ -355,6 +379,11 @@ class TtsFileSaverPlugin : Plugin() {
                 }
 
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
+                // Engine có thật sự theo `rate` không? Nếu không, mỗi đoạn tạo xong sẽ được đổi
+                // tốc độ bằng phần mềm trước khi ghép (xem probeSpeedResidual). Ở đây
+                // speakCancelled luôn là true (do synthesizeToFile() đặt) nên không dùng làm điều kiện hủy.
+                val speedResidual = probeSpeedResidual(engine, voiceName, lang, rate, false)
+                if (speedResidual != 1.0f) emitSpeedMode(true, speedResidual, false)
                 // Xuất file dùng đoạn LỚN hơn đoạn đọc trực tiếp (xem FILE_CHUNK_LEN).
                 // Bỏ đoạn không có chữ/số nào (cùng lý do như khi đọc qua loa: engine không
                 // gọi callback cho đoạn chỉ gồm dấu câu -> phải chờ hết 90 giây rồi báo lỗi).
@@ -548,6 +577,15 @@ class TtsFileSaverPlugin : Plugin() {
                         OUTCOME_DONE -> {
                             val f = chunkFileOf(index)
                             if (f.exists() && f.length() > 0L) {
+                                if (speedResidual != 1.0f) {
+                                    try {
+                                        if (!SoftwareSpeed.stretchFileInPlace(f, speedResidual.toDouble())) {
+                                            Log.w(TAG, "Đoạn ${index + 1}: định dạng âm thanh không hỗ trợ đổi tốc độ phần mềm (giữ nguyên).")
+                                        }
+                                    } catch (t: Throwable) {
+                                        Log.w(TAG, "Đổi tốc độ phần mềm thất bại ở đoạn ${index + 1} (giữ nguyên): ${t.message}")
+                                    }
+                                }
                                 doneCount++
                                 reportProgress()
                             } else {
@@ -871,9 +909,33 @@ class TtsFileSaverPlugin : Plugin() {
                 call.reject("Bộ máy Text-to-Speech chưa sẵn sàng. Vui lòng thử lại sau vài giây.")
                 return@runOnExecutor
             }
+            var softPlayer: SpeedAudioPlayer? = null
+            var speedDir: File? = null
             try {
                 speakCancelled = false
                 applyVoiceSettings(engine, voiceName, lang, rate, pitch)
+
+                // Engine có thật sự đọc nhanh/chậm theo `rate` không? Nếu không (hoặc chỉ một
+                // phần) thì phần còn thiếu được bù bằng phần mềm. 1.0 = khỏi bù.
+                val speedResidual = probeSpeedResidual(engine, voiceName, lang, rate, true)
+                var softwareSpeed = false
+                if (speedResidual != 1.0f && !speakCancelled) {
+                    try {
+                        val dir = File(context.cacheDir, "tts_speed_${System.currentTimeMillis()}")
+                        if (dir.mkdirs() || dir.exists()) {
+                            speedDir = dir
+                            val player = SpeedAudioPlayer(speechAudioAttributes)
+                            softPlayer = player
+                            activePlayer = player
+                            softwareSpeed = true
+                            emitSpeedMode(true, speedResidual, false)
+                        }
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Không bật được tốc độ phần mềm (đọc theo cách thường): ${t.message}")
+                        softwareSpeed = false
+                    }
+                }
+                val cancelFlag = SpeedAudioPlayer.CancelFlag { speakCancelled }
 
                 if (warmup) {
                     // Xin AudioFocus TƯỜNG MINH và giữ CPU thức (WakeLock) trong
@@ -952,16 +1014,24 @@ class TtsFileSaverPlugin : Plugin() {
                 fun submitItem(at: Int): SpeakSlot? {
                     val item = items[at]
                     val uid = newUtteranceId("speak_${item.sentenceIndex}_${item.subIdx}")
-                    val slot = SpeakSlot(uid, CountDownLatch(1), AtomicInteger(OUTCOME_PENDING))
+                    // Chế độ tốc độ phần mềm: engine chỉ tổng hợp ra file tạm; ta tự đổi tốc độ rồi phát.
+                    val dir = speedDir
+                    val wavFile: File? = if (softwareSpeed && dir != null) File(dir, "$uid.wav") else null
+                    val slot = SpeakSlot(uid, CountDownLatch(1), AtomicInteger(OUTCOME_PENDING), wavFile)
                     slots[uid] = slot
                     val r = try {
-                        engine.speak(item.text, TextToSpeech.QUEUE_ADD, Bundle(), uid)
+                        if (wavFile != null) {
+                            engine.synthesizeToFile(item.text, Bundle(), wavFile, uid)
+                        } else {
+                            engine.speak(item.text, TextToSpeech.QUEUE_ADD, Bundle(), uid)
+                        }
                     } catch (t: Throwable) {
                         Log.e(TAG, "speak() ném lỗi ở câu ${item.sentenceIndex}, đoạn ${item.subIdx}: ${t.message}", t)
                         TextToSpeech.ERROR
                     }
                     if (r != TextToSpeech.SUCCESS) {
                         slots.remove(uid)
+                        try { wavFile?.delete() } catch (_: Throwable) {}
                         return null
                     }
                     return slot
@@ -977,7 +1047,10 @@ class TtsFileSaverPlugin : Plugin() {
                 // chen ngang) để vòng sau gửi lại ĐÚNG từ `pos`, không đọc lệch thứ tự.
                 fun dropQueued() {
                     for (k in pos..minOf(pos + 1, items.size - 1)) {
-                        queued[k]?.let { slots.remove(it.id) }
+                        queued[k]?.let {
+                            slots.remove(it.id)
+                            try { it.file?.delete() } catch (_: Throwable) {}
+                        }
                         queued[k] = null
                     }
                 }
@@ -1061,6 +1134,48 @@ class TtsFileSaverPlugin : Plugin() {
                         }
                         outcome = slot.outcome.get()
                         slots.remove(slot.id)
+
+                        // CHẾ ĐỘ TỐC ĐỘ PHẦN MỀM: engine vừa tổng hợp xong ra file -> đổi tốc độ rồi
+                        // phát bằng AudioTrack. Trong lúc đang phát đoạn này, engine đã tổng hợp sẵn
+                        // đoạn kế tiếp (prefetch) nên các đoạn vẫn nối liền nhau.
+                        val wavFile = slot.file
+                        if (wavFile != null) {
+                            if (outcome == OUTCOME_DONE) {
+                                var played = false
+                                val player = softPlayer
+                                try {
+                                    if (player != null) {
+                                        val pcm = SoftwareSpeed.readPcm16(wavFile)
+                                        if (pcm != null) {
+                                            val stretched = SoftwareSpeed.stretchPcm16(
+                                                pcm.samples, pcm.channels, pcm.sampleRate, speedResidual.toDouble()
+                                            )
+                                            player.write(stretched, pcm.sampleRate, pcm.channels, cancelFlag)
+                                            played = true
+                                        }
+                                    }
+                                } catch (t: Throwable) {
+                                    Log.w(TAG, "Tốc độ phần mềm thất bại ở đoạn ${pos + 1}: ${t.message}")
+                                }
+                                try { wavFile.delete() } catch (_: Throwable) {}
+                                if (speakCancelled) break@loop
+                                if (!played) {
+                                    // Không đổi tốc độ / không phát được bằng phần mềm (định dạng lạ,
+                                    // thiết bị không tạo được AudioTrack...): quay về đọc trực tiếp
+                                    // bằng engine cho phần còn lại thay vì làm hỏng cả bài.
+                                    softwareSpeed = false
+                                    activePlayer = null
+                                    try { softPlayer?.release() } catch (_: Throwable) {}
+                                    softPlayer = null
+                                    dropQueued()
+                                    try { engine.stop() } catch (_: Throwable) {}
+                                    emitSpeedMode(false, 1.0f, true)
+                                    continue@loop
+                                }
+                            } else {
+                                try { wavFile.delete() } catch (_: Throwable) {}
+                            }
+                        }
                     }
 
                     when (outcome) {
@@ -1100,6 +1215,17 @@ class TtsFileSaverPlugin : Plugin() {
                     }
                 }
 
+                // Tốc độ phần mềm: đọc xong tự nhiên thì chờ AudioTrack phát nốt phần còn lại
+                // (để kết quả "đã đọc xong" khớp với tiếng thật); hủy/lỗi thì tắt tiếng ngay.
+                val finalPlayer = softPlayer
+                if (finalPlayer != null) {
+                    if (!speakCancelled && !failed && pos >= items.size) {
+                        finalPlayer.finish(cancelFlag)
+                    } else {
+                        finalPlayer.abortAsync()
+                    }
+                }
+
                 if (failed) {
                     // Dừng hẳn do lỗi: xoá nốt đoạn đã xếp trước trong engine, nếu không nó
                     // vẫn tự đọc tiếp sau khi ta đã báo thất bại cho người dùng.
@@ -1136,6 +1262,9 @@ class TtsFileSaverPlugin : Plugin() {
                 // Luôn nhả WakeLock khi phiên đọc kết thúc (dù xong xuôi, lỗi
                 // hay bị stopSpeaking() hủy giữa chừng) — không giữ CPU thức
                 // ngoài lúc thật sự cần thiết.
+                activePlayer = null
+                try { softPlayer?.release() } catch (_: Throwable) {}
+                try { speedDir?.deleteRecursively() } catch (_: Throwable) {}
                 releaseWakeLock()
                 // Nhả AudioFocus cả khi đọc XONG TỰ NHIÊN hoặc dừng do lỗi. Bản cũ chỉ
                 // nhả khi bấm Dừng/Lưu/đổi bộ đọc nên sau khi đọc hết bài, app vẫn giữ
@@ -1152,6 +1281,9 @@ class TtsFileSaverPlugin : Plugin() {
             stopEpoch.incrementAndGet()
             speakCancelled = true
             tts?.stop()
+            // Tốc độ phần mềm: tiếng phát từ AudioTrack của app, không phải của engine, nên
+            // tts.stop() không tắt được -> tắt trực tiếp để Dừng có hiệu lực ngay lập tức.
+            activePlayer?.abortAsync()
             // Giải phóng ngay thread đang chờ trong speak(), tránh việc lệnh đọc
             // tiếp theo (xếp hàng sau trên cùng 1 executor) phải chờ tới 30 giây.
             currentLatch?.countDown()
@@ -1301,6 +1433,125 @@ class TtsFileSaverPlugin : Plugin() {
             Log.w(TAG, "Lỗi khi nhả WakeLock (không quan trọng): ${t.message}")
         } finally {
             wakeLock = null
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Báo cho JS biết app đang tự chỉnh tốc độ bằng phần mềm (hoặc đã phải bỏ cách đó).
+    // ------------------------------------------------------------------
+    private fun emitSpeedMode(software: Boolean, factor: Float, fallback: Boolean) {
+        try {
+            val p = JSObject()
+            p.put("software", software)
+            p.put("factor", factor.toDouble())
+            p.put("fallback", fallback)
+            notifyListeners("speedMode", p)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Không gửi được sự kiện speedMode: ${t.message}")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Đo xem engine có thật sự thực hiện tốc độ `rate` không. Trả về hệ số cần bù bằng
+    // phần mềm: 1.0 = engine đã làm đúng (hoặc không đo được -> giữ hành vi cũ).
+    // Cách đo: tổng hợp cùng 1 câu mẫu ở tốc độ 1.0 và `rate`, so thời lượng CÓ TIẾNG
+    // (bỏ khoảng lặng đầu/cuối). Engine đạt tốc độ m = t(1.0) / t(rate); cần bù rate / m.
+    //  - Engine bỏ qua tốc độ:  m ~ 1       -> bù đủ `rate`.
+    //  - Engine làm một phần:   1 < m < rate -> bù phần còn thiếu.
+    //  - Engine làm đúng:       m ~ rate     -> 1.0 (không đụng tới).
+    // Kết quả được nhớ theo (engine, giọng, tốc độ) nên chỉ tốn ~1-2 giây ở lần đầu.
+    // abortIfCancelled: khi đang đọc, bấm Dừng giữa lúc đo thì thoát ngay; khi xuất file
+    // thì speakCancelled luôn là true nên phải truyền false.
+    // ------------------------------------------------------------------
+    private fun probeSpeedResidual(
+        engine: TextToSpeech,
+        voiceName: String,
+        lang: String,
+        rate: Float,
+        abortIfCancelled: Boolean
+    ): Float {
+        if (!SOFTWARE_SPEED_ENABLED) return 1.0f
+        val wanted = rate.coerceIn(0.25f, 4.0f)
+        if (Math.abs(wanted - 1.0f) < 0.05f) return 1.0f
+
+        val engineKey = "${activeEngineName ?: ""}|${voiceName.ifBlank { lang }}"
+        val cacheKey = "$engineKey|$wanted"
+        speedResidualCache[cacheKey]?.let { return it }
+        if ((speedProbeFails[engineKey] ?: 0) >= 2) return 1.0f
+
+        val phrase = if (lang.startsWith("vi", ignoreCase = true)) PROBE_TEXT_VI else PROBE_TEXT_EN
+        try {
+            var base = speedBaseSeconds[engineKey]
+            if (base == null) {
+                engine.setSpeechRate(1.0f)
+                base = probeOnce(engine, phrase)
+                if (base != null) speedBaseSeconds[engineKey] = base
+            }
+            if (abortIfCancelled && speakCancelled) return 1.0f
+            if (base == null) {
+                speedProbeFails[engineKey] = (speedProbeFails[engineKey] ?: 0) + 1
+                return 1.0f
+            }
+            engine.setSpeechRate(wanted)
+            val measured = probeOnce(engine, phrase)
+            if (abortIfCancelled && speakCancelled) return 1.0f
+            if (measured == null) {
+                speedProbeFails[engineKey] = (speedProbeFails[engineKey] ?: 0) + 1
+                return 1.0f
+            }
+            val delivered = base / measured
+            val residual = (wanted / delivered).toFloat().coerceIn(0.25f, 4.0f)
+            // Sai lệch dưới 12% (engine làm gần đúng, hoặc nhiễu đo như độ dài khoảng nghỉ giữa câu)
+            // thì KHÔNG bù: giữ nguyên đường đọc trực tiếp đang chạy tốt với engine Google.
+            // Engine bỏ qua tốc độ luôn lệch >= 25% với mọi mức trong danh sách (0.5/0.75/1.25/1.5/2.0).
+            val result = if (Math.abs(residual - 1.0f) < 0.12f) 1.0f else residual
+            speedResidualCache[cacheKey] = result
+            val deliveredText = String.format(Locale.US, "%.2f", delivered)
+            val resultText = String.format(Locale.US, "%.2f", result)
+            Log.i(TAG, "Đo tốc độ engine [$engineKey]: yêu cầu ${wanted}x, engine đạt ${deliveredText}x -> bù phần mềm ${resultText}x")
+            return result
+        } catch (t: Throwable) {
+            Log.w(TAG, "Đo tốc độ engine thất bại (giữ hành vi cũ): ${t.message}")
+            speedProbeFails[engineKey] = (speedProbeFails[engineKey] ?: 0) + 1
+            return 1.0f
+        } finally {
+            try { engine.setSpeechRate(wanted) } catch (_: Throwable) {}
+        }
+    }
+
+    // Tổng hợp `text` ra file tạm bằng cài đặt hiện tại của engine, trả về thời lượng có tiếng (giây)
+    // hoặc null nếu thất bại / hết hạn / định dạng không phân tích được.
+    private fun probeOnce(engine: TextToSpeech, text: String): Double? {
+        val file = File(context.cacheDir, "speed_probe_${utteranceSeq.incrementAndGet()}.wav")
+        try {
+            val uid = newUtteranceId("probe")
+            val latch = CountDownLatch(1)
+            val outcome = AtomicInteger(OUTCOME_PENDING)
+            engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                private fun post(id: String?, result: Int) {
+                    if (id != uid) return
+                    if (outcome.compareAndSet(OUTCOME_PENDING, result)) latch.countDown()
+                }
+                override fun onStart(id: String?) {}
+                override fun onDone(id: String?) { post(id, OUTCOME_DONE) }
+                @Deprecated("Deprecated in Java")
+                override fun onError(id: String?) { post(id, OUTCOME_ERROR) }
+                override fun onError(id: String?, errorCode: Int) { post(id, OUTCOME_ERROR) }
+                override fun onStop(id: String?, interrupted: Boolean) { post(id, OUTCOME_STOPPED) }
+            })
+            if (engine.synthesizeToFile(text, Bundle(), file, uid) != TextToSpeech.SUCCESS) return null
+            if (!latch.await(PROBE_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+                try { engine.stop() } catch (_: Throwable) {}
+                return null
+            }
+            if (outcome.get() != OUTCOME_DONE) return null
+            val seconds = SoftwareSpeed.activeSeconds(file)
+            return if (seconds > 0.3) seconds else null
+        } catch (t: Throwable) {
+            Log.w(TAG, "probeOnce thất bại: ${t.message}")
+            return null
+        } finally {
+            try { file.delete() } catch (_: Throwable) {}
         }
     }
 
