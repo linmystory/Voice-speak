@@ -477,6 +477,7 @@
   // sang trạng thái đang chạy có các bước await (hỏi trạng thái engine...). Nếu không
   // chặn, chạm 2 lần liên tiếp gửi 2 lệnh -> đọc trùng hai lần / xuất file hai lần.
   let startInFlight = false;
+  let lastSpeedToastKey = ''; // chỉ báo "tốc độ phần mềm" 1 lần cho mỗi mức bù khác nhau
   let saveInFlight = false;
   const SAVE_LABEL = '💾 Lưu âm thanh';
 
@@ -939,6 +940,25 @@
     plugin.addListener('saveProgress', (data) => {
       if (data && typeof data.done === 'number' && typeof data.total === 'number' && data.total > 0) {
         statusText.textContent = `Đang tạo file âm thanh… ${data.done}/${data.total} đoạn`;
+      }
+    });
+    // Nhiều bộ đọc (ngoài Google) bỏ qua yêu cầu đổi tốc độ. App tự đo, và nếu bộ đọc không
+    // làm đúng thì tự chỉnh tốc độ bằng phần mềm; thông báo 1 lần để người dùng biết vì sao
+    // lúc này tiếng được xử lý thêm (và nếu phải bỏ cách đó thì cũng biết vì sao tốc độ không đổi).
+    plugin.addListener('speedMode', (data) => {
+      if (!data) return;
+      if (data.fallback) {
+        showToast('Không chỉnh được tốc độ bằng phần mềm trên máy này, sẽ đọc ở tốc độ gốc của bộ đọc.', true);
+        return;
+      }
+      if (data.software) {
+        const f = Number(data.factor);
+        const key = isFinite(f) ? f.toFixed(2) : '';
+        if (key !== lastSpeedToastKey) {
+          lastSpeedToastKey = key;
+          const shown = isFinite(f) ? ' (×' + f.toFixed(2).replace(/\.?0+$/, '') + ')' : '';
+          showToast('Bộ đọc này không tự đổi được tốc độ nên app điều chỉnh bằng phần mềm' + shown + '.');
+        }
       }
     });
   }
